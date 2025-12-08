@@ -1,6 +1,6 @@
 # Sami LLM Proxy Server
 
-A lightweight HTTP/HTTPS proxy server for routing LLM API requests through a neutral server. Designed for use with [Sami](https://github.com/your-org/sami) or any application that needs to proxy LLM API calls.
+A lightweight HTTP/HTTPS proxy server for routing LLM API requests through a neutral server. Designed for use with Sami or any application that needs to proxy LLM API calls.
 
 ## Features
 
@@ -21,7 +21,7 @@ docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
   --restart unless-stopped \
-  your-username/sami-llm-proxy:latest
+  samiapp/sami-llm-proxy:latest
 ```
 
 ### Docker Compose
@@ -30,7 +30,7 @@ docker run -d \
 version: '3.8'
 services:
   proxy:
-    image: your-username/sami-llm-proxy:latest
+    image: samiapp/sami-llm-proxy:latest
     ports:
       - "8080:8080"
     environment:
@@ -66,7 +66,7 @@ docker run -d \
   -p 8080:8080 \
   -e PROXY_AUTH_USERNAME=admin \
   -e PROXY_AUTH_PASSWORD=secret123 \
-  your-username/sami-llm-proxy:latest
+  samiapp/sami-llm-proxy:latest
 ```
 
 ### Example: With IP Filtering
@@ -76,7 +76,7 @@ docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
   -e ALLOWED_IPS="192.168.1.100,10.0.0.50" \
-  your-username/sami-llm-proxy:latest
+  samiapp/sami-llm-proxy:latest
 ```
 
 ### Example: With Custom Timeout (for slow LLM models)
@@ -87,7 +87,7 @@ docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
   -e PROXY_TIMEOUT_MS=1800000 \
-  your-username/sami-llm-proxy:latest
+  samiapp/sami-llm-proxy:latest
 ```
 
 ## Usage
@@ -139,7 +139,7 @@ docker logs --tail 100 sami-llm-proxy
 
 ```bash
 # Clone repository
-git clone https://github.com/your-org/sami-llm-proxy.git
+git clone https://github.com/sami-projects/sami-llm-proxy.git
 cd sami-llm-proxy
 
 # Build Docker image
@@ -163,7 +163,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- 📖 [Full Documentation](./docs/README.md)
+- 📖 [Full Documentation](https://github.com/sami-projects/sami-llm-proxy#readme)
 - 🐛 [Issue Tracker](https://github.com/sami-projects/sami-llm-proxy/issues)
 - 💬 [Discussions](https://github.com/sami-projects/sami-llm-proxy/discussions)
 
