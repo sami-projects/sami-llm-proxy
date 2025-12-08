@@ -26,6 +26,7 @@ docker run -d \
 
 ### Docker Compose
 
+**Option 1: Using environment variables in docker-compose.yml**
 ```yaml
 version: '3.8'
 services:
@@ -38,6 +39,28 @@ services:
       - PROXY_AUTH_USERNAME=admin
       - PROXY_AUTH_PASSWORD=secret
     restart: unless-stopped
+```
+
+**Option 2: Using .env file (recommended)**
+```yaml
+version: '3.8'
+services:
+  proxy:
+    image: samiapp/sami-llm-proxy:latest
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
+```
+
+Create `.env` file (see `.env.example` for template):
+```bash
+PROXY_PORT=8080
+PROXY_AUTH_USERNAME=admin
+PROXY_AUTH_PASSWORD=secret
+LOG_LEVEL=info
+PROXY_TIMEOUT_MS=1200000
 ```
 
 ```bash
@@ -60,12 +83,32 @@ docker-compose up -d
 
 ### Example: With Authentication
 
+**Option 1: Using environment variables directly**
 ```bash
 docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
   -e PROXY_AUTH_USERNAME=admin \
   -e PROXY_AUTH_PASSWORD=secret123 \
+  samiapp/sami-llm-proxy:latest
+```
+
+**Option 2: Using .env file (recommended)**
+```bash
+# Create .env file (see .env.example for template)
+cat > .env << EOF
+PROXY_PORT=8080
+PROXY_AUTH_USERNAME=admin
+PROXY_AUTH_PASSWORD=secret123
+LOG_LEVEL=info
+PROXY_TIMEOUT_MS=1200000
+EOF
+
+# Run with --env-file
+docker run -d \
+  --name sami-llm-proxy \
+  -p 8080:8080 \
+  --env-file .env \
   samiapp/sami-llm-proxy:latest
 ```
 
@@ -89,6 +132,44 @@ docker run -d \
   -e PROXY_TIMEOUT_MS=1800000 \
   samiapp/sami-llm-proxy:latest
 ```
+
+## Configuration with .env File
+
+For easier configuration, you can use a `.env` file. This is especially useful for Docker Compose or when managing multiple environment variables.
+
+1. **Copy the example file:**
+   ```bash
+   cp .env.example .env
+   ```
+
+2. **Edit `.env` with your settings:**
+   ```bash
+   PROXY_PORT=8080
+   PROXY_AUTH_USERNAME=admin
+   PROXY_AUTH_PASSWORD=your-secure-password
+   LOG_LEVEL=info
+   PROXY_TIMEOUT_MS=1200000
+   ```
+
+3. **Use with Docker:**
+   ```bash
+   docker run -d \
+     --name sami-llm-proxy \
+     -p 8080:8080 \
+     --env-file .env \
+     samiapp/sami-llm-proxy:latest
+   ```
+
+4. **Use with Docker Compose:**
+   ```yaml
+   services:
+     proxy:
+       image: samiapp/sami-llm-proxy:latest
+       env_file:
+         - .env
+   ```
+
+**Security Note:** The `.env` file is excluded from Git (see `.gitignore`). Never commit your `.env` file with real credentials to version control. Use `.env.example` as a template.
 
 ## Usage
 
