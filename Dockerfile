@@ -1,24 +1,24 @@
 # Sami LLM Proxy Server - Dockerfile
-# AI-NOTE: [СОЗДАНО] Воспроизводимый Docker образ для быстрого развертывания
+# AI-NOTE: [CREATED] Reproducible Docker image for quick deployment
 
 FROM node:20-alpine
 
-# Рабочая директория
+# Working directory
 WORKDIR /app
 
-# Копируем package.json и устанавливаем ВСЕ зависимости (нужны dev для сборки)
+# Copy package.json and install ALL dependencies (dev dependencies needed for build)
 COPY package*.json ./
 RUN npm ci
 
-# Копируем исходный код
+# Copy source code
 COPY . .
 
-# Собираем TypeScript
+# Build TypeScript
 RUN npm run build
 
-# Открываем порт
+# Expose port
 EXPOSE 8080
 
-# Запускаем сервер
+# Start server
 CMD ["npm", "start"]
 

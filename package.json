@@ -15,10 +15,17 @@
   "keywords": [
     "proxy",
     "llm",
-    "http-proxy"
+    "http-proxy",
+    "https-proxy",
+    "sami"
   ],
   "author": "",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sami-projects/sami-llm-proxy.git"
+  },
+  "homepage": "https://github.com/sami-projects/sami-llm-proxy#readme",
   "devDependencies": {
     "@types/node": "^20.19.25",
     "tsx": "^4.21.0",

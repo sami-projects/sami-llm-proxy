@@ -5,7 +5,10 @@ dist
 .git
 .gitignore
 README.md
+README_RU.md
 docker-compose.yml
+docs/
 .vscode
 .idea
+Docker/
 

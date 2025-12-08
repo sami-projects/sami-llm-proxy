@@ -9,3 +9,11 @@ dist/
 *.swo
 *~
 
+# Docker build artifacts
+Docker/
+*.tar
+
+# IDE
+.vscode/
+.idea/
+

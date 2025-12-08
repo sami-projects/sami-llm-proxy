@@ -1,10 +1,10 @@
 /**
  * Sami LLM Proxy Server
  * 
- * HTTP/HTTPS прокси-сервер для маршрутизации запросов к LLM провайдерам
+ * HTTP/HTTPS proxy server for routing requests to LLM providers
  * 
- * AI-NOTE: [СОЗДАНО] Простой и воспроизводимый прокси-сервер для развертывания на любом сервере
- * Использует стандартный HTTP прокси протокол, совместимый с https-proxy-agent
+ * AI-NOTE: [CREATED] Simple and reproducible proxy server for deployment on any server
+ * Uses standard HTTP proxy protocol, compatible with https-proxy-agent
  */
 
 import http from 'http';
@@ -12,23 +12,26 @@ import https from 'https';
 import net from 'net';
 import { parse as parseUrl } from 'url';
 
-// Конфигурация из переменных окружения
+// Configuration from environment variables
 const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
-const PROXY_ADDRESS = process.env.PROXY_ADDRESS || '0.0.0.0'; // AI-NOTE: 0.0.0.0 = слушать на всех интерфейсах (правильно для Docker)
+const PROXY_ADDRESS = process.env.PROXY_ADDRESS || '0.0.0.0'; // AI-NOTE: 0.0.0.0 = listen on all interfaces (correct for Docker)
 const PROXY_AUTH_USERNAME = process.env.PROXY_AUTH_USERNAME;
 const PROXY_AUTH_PASSWORD = process.env.PROXY_AUTH_PASSWORD;
-const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // AI-NOTE: По умолчанию info
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // AI-NOTE: Default is info
 const ALLOWED_IPS = process.env.ALLOWED_IPS?.split(',').map(ip => ip.trim()).filter(Boolean) || [];
+// AI-NOTE: Request timeout in milliseconds (default: 20 minutes for slow LLM models with thinking mode)
+// Can be set via PROXY_TIMEOUT_MS environment variable
+const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || '1200000', 10); // 20 minutes default
 
-// Логирование
+// Logging
 function log(level: 'info' | 'debug' | 'error', message: string, data?: any) {
   const levels: Record<string, number> = { error: 0, info: 1, debug: 2 };
-  const currentLevel = levels[LOG_LEVEL] ?? levels['info']; // AI-NOTE: По умолчанию info, если LOG_LEVEL невалиден (LOG_LEVEL уже нормализован в lowercase)
+  const currentLevel = levels[LOG_LEVEL] ?? levels['info']; // AI-NOTE: Default to info if LOG_LEVEL is invalid (LOG_LEVEL is already normalized to lowercase)
   const messageLevel = levels[level] ?? 0;
   
-  // AI-NOTE: [ИСПРАВЛЕНО] Логируем только если уровень сообщения <= текущему уровню
+  // AI-NOTE: [FIXED] Log only if message level <= current level
   // error (0) <= info (1) <= debug (2)
-  // Пример: при LOG_LEVEL=info выводятся error (0) и info (1), но не debug (2)
+  // Example: with LOG_LEVEL=info, error (0) and info (1) are logged, but not debug (2)
   if (messageLevel <= currentLevel) {
     const timestamp = new Date().toISOString();
     const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
@@ -36,10 +39,10 @@ function log(level: 'info' | 'debug' | 'error', message: string, data?: any) {
   }
 }
 
-// Проверка Basic Auth
+// Basic Auth check
 function checkAuth(authHeader: string | undefined): boolean {
   if (!PROXY_AUTH_USERNAME || !PROXY_AUTH_PASSWORD) {
-    return true; // Аутентификация не требуется
+    return true; // Authentication not required
   }
 
   if (!authHeader || !authHeader.startsWith('Basic ')) {
@@ -55,36 +58,36 @@ function checkAuth(authHeader: string | undefined): boolean {
   }
 }
 
-// Проверка разрешенных IP
+// Allowed IP check
 function checkIP(clientIP: string): boolean {
   if (ALLOWED_IPS.length === 0) {
-    return true; // Ограничений нет
+    return true; // No restrictions
   }
 
-  // Извлекаем IP из строки (может быть "::ffff:192.168.1.1" для IPv6)
+  // Extract IP from string (may be "::ffff:192.168.1.1" for IPv6)
   const cleanIP = clientIP.replace(/^::ffff:/, '');
   return ALLOWED_IPS.includes(cleanIP) || ALLOWED_IPS.includes(clientIP);
 }
 
-// Функция для проксирования HTTP запроса
+// Function to proxy HTTP request
 function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, targetUrl: string) {
   const parsedUrl = parseUrl(targetUrl);
   
-  // AI-NOTE: [ЗАЩИТА ОТ ОШИБОК] Если порт 443, это всегда HTTPS, даже если протокол указан как http://
-  // В нормальной работе HttpsProxyAgent использует CONNECT для HTTPS запросов (обрабатывается выше, строки 180-236)
-  // Этот код нужен для:
-  // 1. Защиты от неправильных URL (http://target:443) - исправляем на HTTPS
-  // 2. HTTP запросов к серверам на порту 443 (редкий случай)
-  // 3. Обеспечения безопасности - все данные к LLM должны быть зашифрованы
+  // AI-NOTE: [ERROR PROTECTION] If port is 443, it's always HTTPS, even if protocol is specified as http://
+  // In normal operation, HttpsProxyAgent uses CONNECT for HTTPS requests (handled above, lines 180-236)
+  // This code is needed for:
+  // 1. Protection against incorrect URLs (http://target:443) - fix to HTTPS
+  // 2. HTTP requests to servers on port 443 (rare case)
+  // 3. Security - all data to LLM must be encrypted
   const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : (parsedUrl.protocol === 'https:' ? 443 : 80);
   const isHttps = parsedUrl.protocol === 'https:' || port === 443;
   const client = isHttps ? https : http;
   
-  // AI-NOTE: Для HTTP прокси, path должен быть полным (включая query string)
+  // AI-NOTE: For HTTP proxy, path must be full (including query string)
   const path = parsedUrl.path || '/';
   const fullPath = parsedUrl.search ? `${path}${parsedUrl.search}` : path;
   
-  // AI-NOTE: [ИСПРАВЛЕНО] Правильно определяем порт и host заголовок
+  // AI-NOTE: [FIXED] Correctly determine port and host header
   const finalPort = port || (isHttps ? 443 : 80);
   const hostHeader = parsedUrl.host || `${parsedUrl.hostname}:${finalPort}`;
   
@@ -99,7 +102,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     }
   };
 
-  // Удаляем заголовки прокси
+  // Remove proxy headers
   delete (options.headers as any)['proxy-authorization'];
   delete (options.headers as any)['proxy-connection'];
   delete (options.headers as any)['connection'];
@@ -113,7 +116,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   });
 
   const proxyReq = client.request(options, (proxyRes) => {
-    // Копируем статус и заголовки
+    // Copy status and headers
     log('debug', 'Proxy response received', {
       statusCode: proxyRes.statusCode,
       headers: Object.keys(proxyRes.headers)
@@ -137,11 +140,17 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     }
   });
 
-  // Пересылаем тело запроса
+  // Forward request body
   req.pipe(proxyReq);
 
-  // Таймаут
-  proxyReq.setTimeout(300000, () => {
+  // Timeout (configurable via PROXY_TIMEOUT_MS)
+  proxyReq.setTimeout(PROXY_TIMEOUT_MS, () => {
+    log('error', 'HTTP proxy request timeout', { 
+      timeout: PROXY_TIMEOUT_MS, 
+      targetUrl,
+      hostname: options.hostname,
+      port: options.port
+    });
     proxyReq.destroy();
     if (!res.headersSent) {
       res.writeHead(504, { 'Content-Type': 'text/plain' });
@@ -150,11 +159,11 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   });
 }
 
-  // Обработка запросов
+  // Request handling
   const server = http.createServer();
   
-  // AI-NOTE: [КРИТИЧНО] Для CONNECT запросов Node.js использует специальное событие 'connect'
-  // Это событие вызывается ДО обработчика http.createServer для CONNECT запросов
+  // AI-NOTE: [CRITICAL] For CONNECT requests, Node.js uses special 'connect' event
+  // This event is called BEFORE http.createServer handler for CONNECT requests
   server.on('connect', (req, clientSocket, head) => {
     const netSocket = clientSocket as net.Socket;
     const clientIP = netSocket.remoteAddress || 'unknown';
@@ -176,7 +185,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       return;
     }
 
-    // Проверка IP
+    // IP check
     if (!checkIP(clientIP)) {
       log('error', 'IP not allowed', { clientIP });
       clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -184,7 +193,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       return;
     }
 
-    // Проверка аутентификации
+    // Authentication check
     const authHeader = req.headers['proxy-authorization'];
     if (!checkAuth(authHeader)) {
       log('error', 'Authentication failed', { clientIP });
@@ -195,23 +204,24 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
 
     log('info', 'HTTPS tunnel request', { hostname, port, clientIP });
 
-    // Создаем TCP соединение с целевым сервером
+    // Create TCP connection to target server
+    // AI-NOTE: Using PROXY_TIMEOUT_MS for CONNECT tunnel timeout as well
     const targetSocket = net.createConnection({
       host: hostname,
       port: port,
-      timeout: 300000,
+      timeout: PROXY_TIMEOUT_MS,
     }, () => {
       log('debug', 'Target connection established', { hostname, port });
-      // AI-NOTE: [КРИТИЧНО] Отправляем успешный ответ клиенту
+      // AI-NOTE: [CRITICAL] Send success response to client
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
       log('debug', 'CONNECT response sent', { hostname, port });
       
-      // AI-NOTE: Если есть данные в head (отправленные до установки туннеля), отправляем их
+      // AI-NOTE: If there's data in head (sent before tunnel establishment), forward it
       if (head && head.length > 0) {
         targetSocket.write(head);
       }
       
-      // Начинаем туннелирование данных
+      // Start data tunneling
       targetSocket.pipe(clientSocket, { end: false });
       clientSocket.pipe(targetSocket, { end: false });
     });
@@ -268,10 +278,10 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     });
   });
   
-  // Обработка обычных HTTP запросов (не CONNECT)
+  // Handle regular HTTP requests (not CONNECT)
   server.on('request', (req, res) => {
-    // AI-NOTE: [ОТЛАДКА] Логируем ВСЕ входящие запросы для диагностики
-    // Это должно срабатывать для ВСЕХ запросов, включая CONNECT
+    // AI-NOTE: [DEBUG] Log ALL incoming requests for diagnostics
+    // This should fire for ALL requests, including CONNECT
     const clientIP = req.socket.remoteAddress || 'unknown';
     log('info', '=== INCOMING REQUEST ===', {
       method: req.method,
@@ -285,7 +295,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       complete: req.complete
     });
     
-    // Логирование запроса
+    // Request logging
     log('debug', 'Incoming request', {
       method: req.method,
       url: req.url,
@@ -298,7 +308,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       socketReadyState: req.socket.readyState
     });
 
-  // Проверка IP
+  // IP check
   if (!checkIP(clientIP)) {
     log('error', 'IP not allowed', { clientIP });
     res.writeHead(403, { 'Content-Type': 'text/plain' });
@@ -306,7 +316,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     return;
   }
 
-  // Проверка аутентификации
+  // Authentication check
   const authHeader = req.headers['proxy-authorization'];
   if (!checkAuth(authHeader)) {
     log('error', 'Authentication failed', { clientIP });
@@ -318,13 +328,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     return;
   }
 
-  // AI-NOTE: CONNECT запросы обрабатываются в событии 'connect' выше
-  // Здесь обрабатываем только обычные HTTP запросы (GET, POST, etc.)
-  // Обработка обычных HTTP запросов
-  // AI-NOTE: Для HTTP прокси, клиент отправляет полный URL в req.url
-  // Например: GET http://api.openrouter.ai/api/v1/models HTTP/1.1
-  // Но если это прямой запрос к прокси (не через прокси-агент), 
-  // то req.url будет относительным путем
+  // AI-NOTE: CONNECT requests are handled in 'connect' event above
+  // Here we handle only regular HTTP requests (GET, POST, etc.)
+  // Regular HTTP request handling
+  // AI-NOTE: For HTTP proxy, client sends full URL in req.url
+  // Example: GET http://api.openrouter.ai/api/v1/models HTTP/1.1
+  // But if this is a direct request to proxy (not through proxy agent),
+  // then req.url will be a relative path
   
   if (!req.url) {
     res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -334,25 +344,25 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
 
   let targetUrl: string;
   
-  // Если это полный URL (начинается с http:// или https://)
-  // Это стандартный формат для HTTP прокси
+  // If this is a full URL (starts with http:// or https://)
+  // This is standard format for HTTP proxy
   if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
     targetUrl = req.url;
   } else {
-    // Если это относительный путь, это может быть:
-    // 1. Прямой запрос к прокси (не через прокси-агент) - игнорируем
-    // 2. Ошибка в клиенте
+    // If this is a relative path, it could be:
+    // 1. Direct request to proxy (not through proxy agent) - ignore
+    // 2. Client error
     
-    // AI-NOTE: https-proxy-agent использует CONNECT для HTTPS, 
-    // а для HTTP может отправлять полный URL
-    // Если приходит относительный путь, это скорее всего прямой запрос к прокси
+    // AI-NOTE: https-proxy-agent uses CONNECT for HTTPS,
+    // and for HTTP may send full URL
+    // If relative path arrives, it's most likely a direct request to proxy
     log('debug', 'Relative URL in proxy request (not a proxied request)', {
       url: req.url,
       host: req.headers.host,
       method: req.method
     });
     
-    // Возвращаем информацию о прокси
+    // Return proxy information
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('Sami LLM Proxy Server is running. Use this as HTTP/HTTPS proxy.');
     return;
@@ -364,13 +374,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     clientIP
   });
 
-  // Проксируем HTTP запрос
+  // Proxy HTTP request
   proxyHttpRequest(req, res, targetUrl);
 });
 
-  // AI-NOTE: [ОТЛАДКА] Логируем события сервера ДО запуска
-  // AI-NOTE: [КРИТИЧНО] В Node.js http.createServer должен обрабатывать CONNECT автоматически
-  // Но если запрос не доходит, возможно нужно использовать другой подход
+  // AI-NOTE: [DEBUG] Log server events BEFORE startup
+  // AI-NOTE: [CRITICAL] In Node.js, http.createServer should handle CONNECT automatically
+  // But if request doesn't arrive, may need to use different approach
   server.on('connection', (socket) => {
     const netSocket = socket as net.Socket;
     log('debug', 'New connection', {
@@ -380,8 +390,8 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       localPort: netSocket.localPort
     });
     
-    // AI-NOTE: [ОТЛАДКА] Логируем только события закрытия и ошибок
-    // НЕ логируем 'data' - это перехватывает данные из потока и http.createServer не может их прочитать
+    // AI-NOTE: [DEBUG] Log only close and error events
+    // DO NOT log 'data' - this intercepts data from stream and http.createServer cannot read it
     netSocket.on('close', () => {
       log('debug', 'Socket closed', {
         remoteAddress: netSocket.remoteAddress
@@ -396,14 +406,15 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     });
   });
 
-// Запуск сервера
+// Start server
 server.listen(PROXY_PORT, PROXY_ADDRESS, () => {
   log('info', `Sami LLM Proxy Server started`, {
     port: PROXY_PORT,
     address: PROXY_ADDRESS,
     auth: PROXY_AUTH_USERNAME ? 'enabled' : 'disabled',
     allowedIPs: ALLOWED_IPS.length > 0 ? ALLOWED_IPS : 'all',
-    logLevel: LOG_LEVEL
+    logLevel: LOG_LEVEL,
+    timeout: `${PROXY_TIMEOUT_MS}ms (${Math.round(PROXY_TIMEOUT_MS / 60000)} minutes)`
   });
 });
 

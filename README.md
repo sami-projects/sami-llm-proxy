@@ -1,238 +1,173 @@
 # Sami LLM Proxy Server
 
-Независимый прокси-сервер для маршрутизации запросов к LLM провайдерам через нейтральный сервер.
+A lightweight HTTP/HTTPS proxy server for routing LLM API requests through a neutral server. Designed for use with [Sami](https://github.com/your-org/sami) or any application that needs to proxy LLM API calls.
 
-**Это самостоятельный проект**, который можно развернуть отдельно от основного приложения Sami.
+## Features
 
-> 📖 **Подробное руководство:** См. [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) для детального объяснения всех вариантов сборки и развертывания.
-> 
-> 📦 **Экспорт образа:** См. [EXPORT_DOCKER_IMAGE.md](./EXPORT_DOCKER_IMAGE.md) для инструкций по сборке образа на сервере и экспорту на локальную машину.
-> 
-> 🌐 **Сеть Docker:** См. [DOCKER_NETWORKING.md](./DOCKER_NETWORKING.md) для понимания как работает сеть и доступность прокси снаружи.
-> 
-> 📋 **Логи:** См. [LOGGING.md](./LOGGING.md) для подробных инструкций по работе с логами.
-> 
-> 🔄 **Автоперезапуск:** 
-> - **Быстрая настройка:** См. [AUTO_RESTART_QUICK.md](./AUTO_RESTART_QUICK.md) для минимальной настройки (2 команды)
-> - **Полное руководство:** См. [AUTO_RESTART.md](./AUTO_RESTART.md) для детальной настройки с systemd service
+- ✅ **HTTP/HTTPS Proxy** - Standard HTTP proxy protocol with CONNECT method support
+- ✅ **Basic Authentication** - Optional username/password protection
+- ✅ **IP Filtering** - Restrict access by IP addresses
+- ✅ **Configurable Logging** - Control log verbosity (error, info, debug)
+- ✅ **Docker Ready** - Pre-configured for easy deployment
+- ✅ **Lightweight** - Minimal dependencies, fast startup
 
-## Структура проекта
+## Quick Start
 
-```
-D:\Research\Sami\
-  ├── v01\              # Основное приложение Sami
-  └── proxy-server\     # Этот проект (независимый)
-      ├── src\
-      ├── package.json
-      ├── Dockerfile
-      └── ...
-```
-
-Проект полностью независим и может быть развернут на любом сервере отдельно от основного приложения.
-
-## Быстрое развертывание
-
-### Вариант 1: Docker (рекомендуется)
+### Docker (Recommended)
 
 ```bash
-# Собрать образ
-docker build -t sami-llm-proxy .
-
-# Запустить
+# Pull and run
 docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
-  -e PROXY_PORT=8080 \
-  sami-llm-proxy
+  --restart unless-stopped \
+  your-username/sami-llm-proxy:latest
 ```
 
-### Вариант 2: Docker Compose
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  proxy:
+    image: your-username/sami-llm-proxy:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - PROXY_PORT=8080
+      - PROXY_AUTH_USERNAME=admin
+      - PROXY_AUTH_PASSWORD=secret
+    restart: unless-stopped
+```
 
 ```bash
-# Запустить
 docker-compose up -d
-
-# Остановить (контейнер НЕ перезапустится автоматически)
-docker-compose down
-
-# Перезапустить
-docker-compose restart
 ```
 
-### Вариант 3: Напрямую через Node.js
+## Configuration
 
-```bash
-npm install
-npm start
-```
+### Environment Variables
 
-## Настройка
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROXY_PORT` | `8080` | Port to listen on |
+| `PROXY_ADDRESS` | `0.0.0.0` | Address to bind to (`0.0.0.0` = all interfaces) |
+| `PROXY_AUTH_USERNAME` | - | Basic Auth username (optional) |
+| `PROXY_AUTH_PASSWORD` | - | Basic Auth password (optional) |
+| `LOG_LEVEL` | `info` | Logging level: `error`, `info`, or `debug` |
+| `ALLOWED_IPS` | - | Comma-separated list of allowed IP addresses |
+| `PROXY_TIMEOUT_MS` | `1200000` | Request timeout in milliseconds (default: 20 minutes). Increase for slow LLM models with thinking mode |
 
-### Переменные окружения
+### Example: With Authentication
 
-- `PROXY_PORT` - Порт прокси-сервера (по умолчанию: 8080)
-- `PROXY_ADDRESS` - Адрес для прослушивания (по умолчанию: `0.0.0.0` - все интерфейсы)
-  - `0.0.0.0` - слушать на всех интерфейсах (рекомендуется для Docker)
-  - `127.0.0.1` или `localhost` - только локальный доступ
-  - Конкретный IP - слушать только на этом интерфейсе
-- `PROXY_AUTH_USERNAME` - Имя пользователя для Basic Auth (опционально)
-- `PROXY_AUTH_PASSWORD` - Пароль для Basic Auth (опционально)
-- `LOG_LEVEL` - Уровень логирования (info, debug, error)
-- `ALLOWED_IPS` - Разрешенные IP адреса через запятую (опционально)
-
-### Пример с аутентификацией
-
-**Вариант 1: Через переменные окружения (простой способ)**
 ```bash
 docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
   -e PROXY_AUTH_USERNAME=admin \
   -e PROXY_AUTH_PASSWORD=secret123 \
-  sami-llm-proxy
+  your-username/sami-llm-proxy:latest
 ```
 
-**Вариант 2: Через .env файл (безопаснее)**
-```bash
-# Создайте .env файл:
-echo "PROXY_AUTH_USERNAME=admin" > .env
-echo "PROXY_AUTH_PASSWORD=secret123" >> .env
+### Example: With IP Filtering
 
-# Используйте:
+```bash
 docker run -d \
   --name sami-llm-proxy \
   -p 8080:8080 \
-  --env-file .env \
-  sami-llm-proxy
+  -e ALLOWED_IPS="192.168.1.100,10.0.0.50" \
+  your-username/sami-llm-proxy:latest
 ```
 
-**Вариант 3: Через docker-compose.yml**
-Отредактируйте `docker-compose.yml` и раскомментируйте строки с `PROXY_AUTH_USERNAME` и `PROXY_AUTH_PASSWORD`.
-
-> 📖 **Подробнее:** См. [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md) раздел "Настройка аутентификации"
-
-## Использование в Sami
-
-В настройках приложения Sami укажите:
-
-- **Host**: IP адрес или домен вашего сервера
-- **Port**: 8080 (или другой порт)
-- **Type**: http
-- **Username**: (если настроена аутентификация)
-- **Password**: (если настроена аутентификация)
-
-## Проверка работы
+### Example: With Custom Timeout (for slow LLM models)
 
 ```bash
-# Проверить статус
+# 30 minutes timeout for slow thinking models
+docker run -d \
+  --name sami-llm-proxy \
+  -p 8080:8080 \
+  -e PROXY_TIMEOUT_MS=1800000 \
+  your-username/sami-llm-proxy:latest
+```
+
+## Usage
+
+### In Sami Application
+
+Configure proxy settings in Sami:
+- **Host**: Your server IP or domain
+- **Port**: `8080` (or your configured port)
+- **Type**: `http`
+- **Username**: (if authentication is enabled)
+- **Password**: (if authentication is enabled)
+
+### Testing
+
+```bash
+# Test proxy connectivity
 curl http://your-server:8080
 
-# Проверить через прокси
+# Test proxied request
 curl -x http://your-server:8080 https://api.openai.com/v1/models
+
+# With authentication
+curl -x http://admin:secret123@your-server:8080 https://api.openai.com/v1/models
 ```
 
-## Логи
-
-### Просмотр логов Docker контейнера
-
-**Базовые команды:**
+## Logs
 
 ```bash
-# Посмотреть последние логи
+# View logs
 docker logs sami-llm-proxy
 
-# Посмотреть последние 100 строк
+# Follow logs
+docker logs -f sami-llm-proxy
+
+# Last 100 lines
 docker logs --tail 100 sami-llm-proxy
-
-# Следить за логами в реальном времени (как tail -f)
-docker logs -f sami-llm-proxy
-
-# Следить с последних 50 строк
-docker logs -f --tail 50 sami-llm-proxy
-
-# Логи с временными метками
-docker logs -f --timestamps sami-llm-proxy
-
-# Логи за последний час
-docker logs --since 1h sami-llm-proxy
-
-# Логи за определенный период
-docker logs --since "2025-12-07T20:00:00" --until "2025-12-07T21:00:00" sami-llm-proxy
 ```
 
-**Полезные комбинации:**
+## Security Recommendations
+
+1. **Use HTTPS** - Set up a reverse proxy (Nginx/Caddy) with SSL/TLS
+2. **Enable Authentication** - Always set `PROXY_AUTH_USERNAME` and `PROXY_AUTH_PASSWORD`
+3. **Restrict IPs** - Use `ALLOWED_IPS` to limit access
+4. **Firewall** - Configure firewall rules to restrict access
+5. **Keep Updated** - Regularly pull the latest image
+
+## Building from Source
 
 ```bash
-# Следить за логами и фильтровать по ключевым словам
-docker logs -f sami-llm-proxy | grep -i "error\|connect\|tunnel"
+# Clone repository
+git clone https://github.com/your-org/sami-llm-proxy.git
+cd sami-llm-proxy
 
-# Сохранить логи в файл
-docker logs sami-llm-proxy > proxy-logs.txt
-
-# Посмотреть только ошибки
-docker logs sami-llm-proxy 2>&1 | grep -i error
-```
-
-### Прямой запуск (без Docker)
-
-Логи доступны через:
-- Файл: `logs/proxy.log` (если запущено напрямую)
-- Консоль: вывод в stdout/stderr
-
-## Безопасность
-
-1. **Используйте HTTPS** - настройте reverse proxy (Nginx/Caddy) с SSL
-2. **Настройте аутентификацию** - используйте переменные окружения
-3. **Ограничьте доступ** - используйте firewall или ALLOWED_IPS
-4. **Регулярно обновляйте** - следите за обновлениями образа
-
-## Развертывание на Ubuntu 24
-
-```bash
-# 1. Установить Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-
-# 2. Скопировать proxy-server/ на сервер (через git, scp, или вручную)
-# Например, если скопировали в /opt/sami-llm-proxy:
-cd /opt/sami-llm-proxy
-
-# 3. Собрать и запустить
-docker build -t sami-llm-proxy .
-docker run -d \
-  --name sami-llm-proxy \
-  --restart unless-stopped \
-  -p 8080:8080 \
-  sami-llm-proxy
-
-# 4. Настроить firewall
-sudo ufw allow 8080/tcp
-```
-
-## Мониторинг
-
-```bash
-# Статус контейнера
-docker ps | grep sami-llm-proxy
-
-# Логи в реальном времени
-docker logs -f sami-llm-proxy
-
-# Использование ресурсов
-docker stats sami-llm-proxy
-```
-
-## Обновление
-
-```bash
-# Остановить и удалить старый контейнер
-docker stop sami-llm-proxy
-docker rm sami-llm-proxy
-
-# Пересобрать образ
+# Build Docker image
 docker build -t sami-llm-proxy .
 
-# Запустить новый контейнер
-docker run -d --name sami-llm-proxy -p 8080:8080 --restart unless-stopped sami-llm-proxy
+# Or run directly with Node.js
+npm install
+npm run build
+npm start
 ```
 
+## Requirements
+
+- Docker (for containerized deployment)
+- Node.js 20+ (for direct deployment)
+- Open port (default: 8080)
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- 📖 [Full Documentation](./docs/README.md)
+- 🐛 [Issue Tracker](https://github.com/sami-projects/sami-llm-proxy/issues)
+- 💬 [Discussions](https://github.com/sami-projects/sami-llm-proxy/discussions)
+
+## Links
+
+- 🐳 [Docker Hub](https://hub.docker.com/r/samiapp/sami-llm-proxy)
+- 📦 [GitHub Repository](https://github.com/sami-projects/sami-llm-proxy)
