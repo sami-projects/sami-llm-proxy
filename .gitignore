@@ -17,3 +17,12 @@ Docker/
 .vscode/
 .idea/
 
+# Documentation (keep only main README.md)
+docs/
+README_RU.md
+DOCKER_HUB_PUBLISH.md
+GITHUB_PUBLISH.md
+LINK_GITHUB_DOCKERHUB.md
+systemd/
+docker-compose.yml
+
