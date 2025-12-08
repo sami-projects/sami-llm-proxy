@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  sami-llm-proxy:
+    build: .
+    container_name: sami-llm-proxy
+    ports:
+      - "8080:8080"
+    environment:
+      - PROXY_PORT=8080
+      # Раскомментируйте для включения аутентификации:
+      # - PROXY_AUTH_USERNAME=admin
+      # - PROXY_AUTH_PASSWORD=your-secure-password
+      # Раскомментируйте для ограничения по IP:
+      # - ALLOWED_IPS=192.168.1.0/24,10.0.0.0/8
+      - LOG_LEVEL=info
+    restart: unless-stopped  # AI-NOTE: Автоматический перезапуск при сбоях и загрузке системы
+    healthcheck:
+      # AI-NOTE: Используем node для проверки, т.к. wget может отсутствовать в alpine образе
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8080', (r) => { process.exit(r.statusCode === 200 || r.statusCode === 400 ? 0 : 1) }).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+

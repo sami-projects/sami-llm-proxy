@@ -1,0 +1,27 @@
+{
+  "name": "sami-llm-proxy",
+  "version": "1.0.0",
+  "description": "Standalone HTTP/HTTPS proxy server for Sami LLM requests. Independent project that can be deployed separately.",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "start:dev": "tsx src/index.ts",
+    "build": "tsc",
+    "docker:build": "docker build -t sami-llm-proxy .",
+    "docker:run": "docker run -d --name sami-llm-proxy -p 8080:8080 sami-llm-proxy"
+  },
+  "keywords": [
+    "proxy",
+    "llm",
+    "http-proxy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.19.25",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
