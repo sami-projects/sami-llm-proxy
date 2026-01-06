@@ -13,7 +13,35 @@ import net from 'net';
 import { parse as parseUrl } from 'url';
 
 // Configuration from environment variables
-const PROXY_PORT = parseInt(process.env.PROXY_PORT || '8080', 10);
+// AI-NOTE: [FIXED] Validate configuration values to prevent NaN and invalid ranges
+function parsePort(envVar: string | undefined, defaultPort: number, name: string): number {
+  const port = parseInt(envVar || String(defaultPort), 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    console.error(`[ERROR] Invalid ${name} port: ${envVar}, using default: ${defaultPort}`);
+    return defaultPort;
+  }
+  return port;
+}
+
+function parseTimeout(envVar: string | undefined, defaultTimeout: number, name: string): number {
+  const timeout = parseInt(envVar || String(defaultTimeout), 10);
+  if (isNaN(timeout) || timeout < 1000 || timeout > 86400000) { // 1 second to 24 hours
+    console.error(`[ERROR] Invalid ${name} timeout: ${envVar}, using default: ${defaultTimeout}ms`);
+    return defaultTimeout;
+  }
+  return timeout;
+}
+
+function parsePositiveInt(envVar: string | undefined, defaultValue: number, name: string): number {
+  const value = parseInt(envVar || String(defaultValue), 10);
+  if (isNaN(value) || value < 1) {
+    console.error(`[ERROR] Invalid ${name}: ${envVar}, using default: ${defaultValue}`);
+    return defaultValue;
+  }
+  return value;
+}
+
+const PROXY_PORT = parsePort(process.env.PROXY_PORT, 8080, 'PROXY_PORT');
 const PROXY_ADDRESS = process.env.PROXY_ADDRESS || '0.0.0.0'; // AI-NOTE: 0.0.0.0 = listen on all interfaces (correct for Docker)
 const PROXY_AUTH_USERNAME = process.env.PROXY_AUTH_USERNAME;
 const PROXY_AUTH_PASSWORD = process.env.PROXY_AUTH_PASSWORD;
@@ -21,22 +49,50 @@ const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // AI-NOTE: D
 const ALLOWED_IPS = process.env.ALLOWED_IPS?.split(',').map(ip => ip.trim()).filter(Boolean) || [];
 // AI-NOTE: Request timeout in milliseconds (default: 20 minutes for slow LLM models with thinking mode)
 // Can be set via PROXY_TIMEOUT_MS environment variable
-const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || '1200000', 10); // 20 minutes default
+const PROXY_TIMEOUT_MS = parseTimeout(process.env.PROXY_TIMEOUT_MS, 1200000, 'PROXY_TIMEOUT_MS'); // 20 minutes default
 // AI-NOTE: Rate limiting only for failed authentication attempts (brute force protection)
 // Successful authenticated requests are not rate limited to allow high-frequency LLM requests and streaming
-const AUTH_FAIL_RATE_LIMIT_WINDOW_MS = parseInt(process.env.AUTH_FAIL_RATE_LIMIT_WINDOW_MS || '300000', 10); // 5 minutes default
-const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parseInt(process.env.AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS || '10', 10); // 10 failed attempts per 5 minutes default
+const AUTH_FAIL_RATE_LIMIT_WINDOW_MS = parseTimeout(process.env.AUTH_FAIL_RATE_LIMIT_WINDOW_MS, 300000, 'AUTH_FAIL_RATE_LIMIT_WINDOW_MS'); // 5 minutes default
+const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parsePositiveInt(process.env.AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS, 10, 'AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS'); // 10 failed attempts per 5 minutes default
 
 // Rate limiting: track failed authentication attempts per IP (brute force protection)
+// AI-NOTE: [FIXED] Add maximum size limit to prevent memory exhaustion DoS
+const MAX_RATE_LIMIT_MAP_SIZE = 10000; // Maximum number of IPs to track
 const authFailRateLimitMap = new Map<string, { count: number; resetTime: number; blockedUntil?: number }>();
 
 // Clean up old rate limit entries periodically
 // AI-NOTE: [FIXED] Store interval reference for cleanup on shutdown
 const rateLimitCleanupInterval = setInterval(() => {
   const now = Date.now();
+  let deletedCount = 0;
+  
+  // Clean up expired entries
   for (const [ip, data] of authFailRateLimitMap.entries()) {
     if (now > data.resetTime && (!data.blockedUntil || now > data.blockedUntil)) {
       authFailRateLimitMap.delete(ip);
+      deletedCount++;
+    }
+  }
+  
+  // AI-NOTE: [FIXED] If map is still too large, remove oldest entries (not blocked)
+  if (authFailRateLimitMap.size > MAX_RATE_LIMIT_MAP_SIZE) {
+    const entries = Array.from(authFailRateLimitMap.entries());
+    // Sort by resetTime (oldest first), but keep blocked entries
+    entries.sort((a, b) => {
+      if (a[1].blockedUntil && b[1].blockedUntil) {
+        return a[1].blockedUntil - b[1].blockedUntil;
+      }
+      if (a[1].blockedUntil) return 1; // Keep blocked entries
+      if (b[1].blockedUntil) return -1;
+      return a[1].resetTime - b[1].resetTime;
+    });
+    
+    // Remove oldest non-blocked entries
+    const toRemove = authFailRateLimitMap.size - MAX_RATE_LIMIT_MAP_SIZE;
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      if (!entries[i][1].blockedUntil) {
+        authFailRateLimitMap.delete(entries[i][0]);
+      }
     }
   }
 }, 60000); // Clean up every minute
@@ -61,6 +117,13 @@ function checkAuthFailRateLimit(clientIP: string): boolean {
 
 // Record failed authentication attempt
 function recordAuthFailure(clientIP: string): void {
+  // AI-NOTE: [FIXED] Prevent DoS by limiting map size
+  // If map is full and IP is not already tracked, don't add it
+  if (authFailRateLimitMap.size >= MAX_RATE_LIMIT_MAP_SIZE && !authFailRateLimitMap.has(clientIP)) {
+    log('debug', 'Rate limit map full, skipping new IP', { clientIP, mapSize: authFailRateLimitMap.size });
+    return;
+  }
+  
   const now = Date.now();
   const entry = authFailRateLimitMap.get(clientIP);
   
@@ -115,7 +178,14 @@ function checkAuth(authHeader: string | undefined): boolean {
 
   try {
     const credentials = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
-    const [username, password] = credentials.split(':');
+    // AI-NOTE: [FIXED] Handle passwords containing ':' character
+    // Split only on first ':' to support passwords with colons
+    const colonIndex = credentials.indexOf(':');
+    if (colonIndex === -1) {
+      return false; // Invalid format: no colon found
+    }
+    const username = credentials.substring(0, colonIndex);
+    const password = credentials.substring(colonIndex + 1);
     return username === PROXY_AUTH_USERNAME && password === PROXY_AUTH_PASSWORD;
   } catch {
     return false;
@@ -200,11 +270,32 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       contentLength: proxyRes.headers['content-length']
     });
     
-    res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+    // AI-NOTE: [FIXED] Check response state before writing headers and piping
+    if (res.destroyed || res.finished) {
+      log('debug', 'Response already closed, ignoring proxy response', { targetUrl });
+      proxyRes.destroy();
+      return;
+    }
+    
+    try {
+      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+    } catch (writeErr) {
+      log('error', 'Failed to write response headers', { 
+        error: (writeErr as Error).message,
+        targetUrl 
+      });
+      proxyRes.destroy();
+      return;
+    }
     
     // AI-NOTE: [FIXED] Explicitly set { end: true } for proper stream completion
     // This ensures all data is properly transferred and stream is closed correctly
-    proxyRes.pipe(res, { end: true });
+    // Check state before piping to avoid errors
+    if (!res.destroyed) {
+      proxyRes.pipe(res, { end: true });
+    } else {
+      proxyRes.destroy();
+    }
     
     // AI-NOTE: [FIXED] Handle response stream errors to prevent IncompleteRead issues
     proxyRes.on('error', (err) => {
@@ -438,20 +529,46 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       timeout: PROXY_TIMEOUT_MS,
     }, () => {
       log('debug', 'Target connection established', { hostname, port });
+      
+      // AI-NOTE: [FIXED] Check socket state before writing
+      if (clientSocket.destroyed || clientSocket.writableEnded) {
+        log('debug', 'Client socket closed before CONNECT response', { hostname, port });
+        targetSocket.destroy();
+        return;
+      }
+      
       // AI-NOTE: [CRITICAL] Send success response to client
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      log('debug', 'CONNECT response sent', { hostname, port });
+      try {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        log('debug', 'CONNECT response sent', { hostname, port });
+      } catch (writeErr) {
+        log('error', 'Failed to write CONNECT response', { 
+          error: (writeErr as Error).message,
+          hostname, 
+          port 
+        });
+        targetSocket.destroy();
+        clientSocket.destroy();
+        return;
+      }
       
       // AI-NOTE: If there's data in head (sent before tunnel establishment), forward it
-      if (head && head.length > 0) {
-        targetSocket.write(head);
+      if (head && head.length > 0 && !targetSocket.destroyed) {
+        try {
+          targetSocket.write(head);
+        } catch (writeErr) {
+          log('debug', 'Failed to write head data', { error: (writeErr as Error).message });
+        }
       }
       
       // AI-NOTE: [FIXED] Start data tunneling with proper stream completion
       // Removed { end: false } to ensure streams are properly closed and all data is transferred
       // This fixes IncompleteRead issues when downloading files through HTTPS tunnels (e.g., Google Slides images)
-      targetSocket.pipe(clientSocket);
-      clientSocket.pipe(targetSocket);
+      // Error handling is done by existing handlers outside this callback
+      if (!clientSocket.destroyed && !targetSocket.destroyed) {
+        targetSocket.pipe(clientSocket);
+        clientSocket.pipe(targetSocket);
+      }
     });
 
     targetSocket.on('error', (err) => {
@@ -653,13 +770,23 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // Extract domain from targetUrl for logging
   try {
     const parsedTargetUrl = parseUrl(targetUrl);
-    log('info', 'Proxying HTTP request', {
-      method: req.method,
-      domain: parsedTargetUrl.hostname,
-      port: parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80),
-      path: parsedTargetUrl.path,
-      clientIP
-    });
+    // AI-NOTE: [FIXED] Validate hostname is not null before logging
+    if (parsedTargetUrl && parsedTargetUrl.hostname) {
+      log('info', 'Proxying HTTP request', {
+        method: req.method,
+        domain: parsedTargetUrl.hostname,
+        port: parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80),
+        path: parsedTargetUrl.path,
+        clientIP
+      });
+    } else {
+      // Fallback if hostname is null
+      log('info', 'Proxying HTTP request', {
+        method: req.method,
+        targetUrl,
+        clientIP
+      });
+    }
   } catch (err) {
     // Fallback to full URL if parsing fails
     log('info', 'Proxying HTTP request', {
@@ -778,6 +905,8 @@ server.on('clientError', (err, socket) => {
 });
 
 // Graceful shutdown
+let shutdownTimeout: NodeJS.Timeout | null = null;
+
 function gracefulShutdown(signal: string) {
   log('info', `${signal} received, shutting down gracefully`);
   
@@ -786,14 +915,25 @@ function gracefulShutdown(signal: string) {
     clearInterval(rateLimitCleanupInterval);
   }
   
+  // AI-NOTE: [FIXED] Prevent multiple shutdown attempts
+  if (shutdownTimeout) {
+    return; // Shutdown already in progress
+  }
+  
   server.close(() => {
     log('info', 'Server closed');
+    // AI-NOTE: [FIXED] Clear shutdown timeout if server closed successfully
+    if (shutdownTimeout) {
+      clearTimeout(shutdownTimeout);
+      shutdownTimeout = null;
+    }
     process.exit(0);
   });
   
   // Force exit after timeout if graceful shutdown fails
-  setTimeout(() => {
+  shutdownTimeout = setTimeout(() => {
     log('error', 'Forced shutdown after timeout');
+    shutdownTimeout = null;
     process.exit(1);
   }, 10000); // 10 seconds timeout
 }
