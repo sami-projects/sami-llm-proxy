@@ -8,6 +8,8 @@ A lightweight HTTP/HTTPS proxy server for routing LLM API requests through a neu
 - ✅ **Basic Authentication** - Optional username/password protection
 - ✅ **Brute Force Protection** - Automatic IP blocking after failed authentication attempts
 - ✅ **IP Filtering** - Restrict access by IP addresses
+- ✅ **Health Check Endpoint** - `/health` and `/status` endpoints for monitoring
+- ✅ **Domain Logging** - INFO-level logging of target domains for monitoring and statistics
 - ✅ **Configurable Logging** - Control log verbosity (error, info, debug)
 - ✅ **Docker Ready** - Pre-configured for easy deployment
 - ✅ **Lightweight** - Minimal dependencies, fast startup
@@ -190,6 +192,10 @@ Configure proxy settings in Sami:
 ```bash
 # Test proxy connectivity
 curl http://your-server:8080
+
+# Test health check endpoint (no authentication required)
+curl http://your-server:8080/health
+# Returns: {"status":"ok","timestamp":"...","uptime":123.45,"version":"1.0.0"}
 
 # Test proxied request
 curl -x http://your-server:8080 https://api.openai.com/v1/models

@@ -170,6 +170,15 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   delete (options.headers as any)['proxy-connection'];
   delete (options.headers as any)['connection'];
 
+  // AI-NOTE: [INFO] Log target domain for monitoring and statistics
+  log('info', 'Proxying request to domain', {
+    domain: options.hostname,
+    port: options.port,
+    method: options.method,
+    isHttps,
+    clientIP: (req.socket.remoteAddress || 'unknown')
+  });
+  
   log('debug', 'Making proxy request', {
     hostname: options.hostname,
     port: options.port,
@@ -350,7 +359,12 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       authFailRateLimitMap.delete(clientIP);
     }
 
-    log('info', 'HTTPS tunnel request', { hostname, port, clientIP });
+    // AI-NOTE: [INFO] Log target domain for monitoring and statistics
+    log('info', 'HTTPS tunnel request', { 
+      domain: hostname, 
+      port, 
+      clientIP 
+    });
 
     // Create TCP connection to target server
     // AI-NOTE: Using PROXY_TIMEOUT_MS for CONNECT tunnel timeout as well
@@ -430,9 +444,23 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   
   // Handle regular HTTP requests (not CONNECT)
   server.on('request', (req, res) => {
+    const clientIP = req.socket.remoteAddress || 'unknown';
+    
+    // AI-NOTE: Health check endpoint for monitoring
+    if (req.url === '/health' || req.url === '/status') {
+      log('debug', 'Health check request', { clientIP });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        version: '1.0.0'
+      }));
+      return;
+    }
+    
     // AI-NOTE: [DEBUG] Log ALL incoming requests for diagnostics
     // This should fire for ALL requests, including CONNECT
-    const clientIP = req.socket.remoteAddress || 'unknown';
     log('info', '=== INCOMING REQUEST ===', {
       method: req.method,
       url: req.url,
@@ -539,11 +567,24 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     return;
   }
 
-  log('info', 'Proxying HTTP request', {
-    method: req.method,
-    targetUrl,
-    clientIP
-  });
+  // Extract domain from targetUrl for logging
+  try {
+    const parsedTargetUrl = parseUrl(targetUrl);
+    log('info', 'Proxying HTTP request', {
+      method: req.method,
+      domain: parsedTargetUrl.hostname,
+      port: parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedTargetUrl.path,
+      clientIP
+    });
+  } catch (err) {
+    // Fallback to full URL if parsing fails
+    log('info', 'Proxying HTTP request', {
+      method: req.method,
+      targetUrl,
+      clientIP
+    });
+  }
 
   // Proxy HTTP request
   proxyHttpRequest(req, res, targetUrl);
