@@ -64,13 +64,11 @@ const authFailRateLimitMap = new Map<string, { count: number; resetTime: number;
 // AI-NOTE: [FIXED] Store interval reference for cleanup on shutdown
 const rateLimitCleanupInterval = setInterval(() => {
   const now = Date.now();
-  let deletedCount = 0;
   
   // Clean up expired entries
   for (const [ip, data] of authFailRateLimitMap.entries()) {
     if (now > data.resetTime && (!data.blockedUntil || now > data.blockedUntil)) {
       authFailRateLimitMap.delete(ip);
-      deletedCount++;
     }
   }
   
@@ -210,9 +208,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // AI-NOTE: [FIXED] Validate parsed URL and hostname
   if (!parsedUrl || !parsedUrl.hostname) {
     log('error', 'Invalid target URL', { targetUrl, clientIP: req.socket.remoteAddress || 'unknown' });
-    if (!res.headersSent) {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Bad Request: Invalid target URL');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: Invalid target URL');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
     }
     return;
   }
@@ -237,21 +239,37 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // AI-NOTE: [FIXED] Correctly determine port and host header
   const hostHeader = parsedUrl.host || `${parsedUrl.hostname}:${finalPort}`;
   
+  // AI-NOTE: [FIXED] Filter headers to prevent leaking internal/proxy headers
+  // Copy headers and remove proxy-specific and potentially dangerous headers
+  const filteredHeaders: Record<string, string | string[] | undefined> = {};
+  const headersToRemove = [
+    'proxy-authorization',
+    'proxy-connection',
+    'connection',
+    'upgrade',
+    'host', // Will be set explicitly
+    'transfer-encoding', // Let Node.js handle this
+    'content-length' // Let Node.js handle this for streaming
+  ];
+  
+  // Copy only safe headers
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lowerKey = key.toLowerCase();
+    if (!headersToRemove.includes(lowerKey) && value !== undefined) {
+      filteredHeaders[key] = value;
+    }
+  }
+  
+  // Set correct host header
+  filteredHeaders['host'] = hostHeader;
+
   const options = {
     hostname: parsedUrl.hostname,
     port: finalPort,
     path: fullPath,
     method: req.method,
-    headers: {
-      ...req.headers,
-      host: hostHeader,
-    }
+    headers: filteredHeaders
   };
-
-  // Remove proxy headers
-  delete (options.headers as any)['proxy-authorization'];
-  delete (options.headers as any)['proxy-connection'];
-  delete (options.headers as any)['connection'];
 
   // AI-NOTE: Domain logging is done in request handler to avoid duplication
   log('debug', 'Making proxy request', {
@@ -373,7 +391,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   });
 
   // AI-NOTE: [FIXED] Explicitly set { end: true } for proper request stream completion
-  req.pipe(proxyReq, { end: true });
+  // Check request state before piping
+  if (!req.destroyed && !req.complete) {
+    req.pipe(proxyReq, { end: true });
+  } else {
+    // Request already destroyed or completed, just end proxy request
+    proxyReq.end();
+  }
   
   // AI-NOTE: [FIXED] Handle incoming request stream errors
   req.on('error', (err) => {
@@ -434,8 +458,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       const closingBracket = targetUrl.indexOf(']');
       if (closingBracket === -1 || targetUrl[closingBracket + 1] !== ':') {
         log('error', 'Invalid CONNECT target (IPv6 format)', { targetUrl, clientIP });
-        clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-        clientSocket.end();
+        if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+          try {
+            clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+            clientSocket.end();
+          } catch (writeErr) {
+            log('debug', 'Failed to write error response', { error: writeErr });
+          }
+        }
         return;
       }
       hostname = targetUrl.substring(1, closingBracket);
@@ -457,8 +487,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     // AI-NOTE: [FIXED] Validate port is a valid number
     if (isNaN(port) || port < 1 || port > 65535) {
       log('error', 'Invalid CONNECT port', { targetUrl, port, clientIP });
-      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-      clientSocket.end();
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
       return;
     }
 
@@ -471,16 +507,28 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
 
     if (!hostname || hostname.length === 0) {
       log('error', 'Invalid CONNECT target (empty hostname)', { targetUrl, clientIP });
-      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
-      clientSocket.end();
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
       return;
     }
 
     // IP check
     if (!checkIP(clientIP)) {
       log('error', 'IP not allowed', { clientIP });
-      clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
-      clientSocket.end();
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
       return;
     }
 
@@ -491,8 +539,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
         clientIP,
         blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
       });
-      clientSocket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
-      clientSocket.end();
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
       return;
     }
 
@@ -503,8 +557,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       recordAuthFailure(clientIP);
       // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
       log('debug', 'Authentication failed', { clientIP });
-      clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Sami LLM Proxy"\r\n\r\n');
-      clientSocket.end();
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Sami LLM Proxy"\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
       return;
     }
     
@@ -564,10 +624,29 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       // AI-NOTE: [FIXED] Start data tunneling with proper stream completion
       // Removed { end: false } to ensure streams are properly closed and all data is transferred
       // This fixes IncompleteRead issues when downloading files through HTTPS tunnels (e.g., Google Slides images)
-      // Error handling is done by existing handlers outside this callback
       if (!clientSocket.destroyed && !targetSocket.destroyed) {
-        targetSocket.pipe(clientSocket);
-        clientSocket.pipe(targetSocket);
+        try {
+          // AI-NOTE: [FIXED] Add error handling for pipe operations
+          const targetToClient = targetSocket.pipe(clientSocket);
+          const clientToTarget = clientSocket.pipe(targetSocket);
+          
+          // Handle pipe errors to ensure both sockets are closed on error
+          targetToClient.on('error', (err) => {
+            log('error', 'Pipe error (target to client)', { error: err.message, hostname, port });
+            if (!clientSocket.destroyed) clientSocket.destroy();
+            if (!targetSocket.destroyed) targetSocket.destroy();
+          });
+          
+          clientToTarget.on('error', (err) => {
+            log('error', 'Pipe error (client to target)', { error: err.message, hostname, port });
+            if (!clientSocket.destroyed) clientSocket.destroy();
+            if (!targetSocket.destroyed) targetSocket.destroy();
+          });
+        } catch (pipeErr) {
+          log('error', 'Failed to setup pipe', { error: (pipeErr as Error).message, hostname, port });
+          if (!clientSocket.destroyed) clientSocket.destroy();
+          if (!targetSocket.destroyed) targetSocket.destroy();
+        }
       }
     });
 
@@ -633,8 +712,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     if (urlPath === '/health' || urlPath === '/status') {
       // Only allow GET and HEAD methods for health check
       if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.writeHead(405, { 'Content-Type': 'text/plain' });
-        res.end('Method Not Allowed');
+        if (!res.headersSent && !res.destroyed) {
+          try {
+            res.writeHead(405, { 'Content-Type': 'text/plain' });
+            res.end('Method Not Allowed');
+          } catch (writeErr) {
+            log('debug', 'Failed to write error response', { error: writeErr });
+          }
+        }
         return;
       }
       
@@ -649,12 +734,20 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
           version: '1.0.0'
         };
         
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(healthData));
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(healthData));
+        }
       } catch (err) {
         log('error', 'Health check error', { error: (err as Error).message, clientIP });
-        res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Internal Server Error');
+        if (!res.headersSent && !res.destroyed) {
+          try {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
+          } catch (writeErr) {
+            log('debug', 'Failed to write health check error', { error: writeErr });
+          }
+        }
       }
       return;
     }
@@ -689,8 +782,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // IP check
   if (!checkIP(clientIP)) {
     log('error', 'IP not allowed', { clientIP });
-    res.writeHead(403, { 'Content-Type': 'text/plain' });
-    res.end('IP address not allowed');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('IP address not allowed');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
     return;
   }
 
@@ -701,8 +800,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       clientIP,
       blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
     });
-    res.writeHead(429, { 'Content-Type': 'text/plain' });
-    res.end('Too Many Requests');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(429, { 'Content-Type': 'text/plain' });
+        res.end('Too Many Requests');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
     return;
   }
 
@@ -713,11 +818,17 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     recordAuthFailure(clientIP);
     // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
     log('debug', 'Authentication failed', { clientIP });
-    res.writeHead(407, {
-      'Content-Type': 'text/plain',
-      'Proxy-Authenticate': 'Basic realm="Sami LLM Proxy"'
-    });
-    res.end('Proxy authentication required');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(407, {
+          'Content-Type': 'text/plain',
+          'Proxy-Authenticate': 'Basic realm="Sami LLM Proxy"'
+        });
+        res.end('Proxy authentication required');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
     return;
   }
   
@@ -736,8 +847,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // then req.url will be a relative path
   
   if (!req.url) {
-    res.writeHead(400, { 'Content-Type': 'text/plain' });
-    res.end('Bad Request: No URL');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: No URL');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
     return;
   }
 
@@ -762,8 +879,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     });
     
     // Return proxy information
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Sami LLM Proxy Server is running. Use this as HTTP/HTTPS proxy.');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Sami LLM Proxy Server is running. Use this as HTTP/HTTPS proxy.');
+      } catch (writeErr) {
+        log('debug', 'Failed to write response', { error: writeErr });
+      }
+    }
     return;
   }
 
