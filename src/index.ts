@@ -182,11 +182,53 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     // Copy status and headers
     log('debug', 'Proxy response received', {
       statusCode: proxyRes.statusCode,
-      headers: Object.keys(proxyRes.headers)
+      headers: Object.keys(proxyRes.headers),
+      contentLength: proxyRes.headers['content-length']
     });
     
     res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-    proxyRes.pipe(res);
+    
+    // AI-NOTE: [FIXED] Explicitly set { end: true } for proper stream completion
+    // This ensures all data is properly transferred and stream is closed correctly
+    proxyRes.pipe(res, { end: true });
+    
+    // AI-NOTE: [FIXED] Handle response stream errors to prevent IncompleteRead issues
+    proxyRes.on('error', (err) => {
+      log('error', 'Response stream error', {
+        error: err.message,
+        code: (err as any).code,
+        targetUrl,
+        hostname: options.hostname,
+        port: options.port
+      });
+      // If headers not sent yet, send error response
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Response stream error: ' + err.message);
+      } else {
+        // Headers already sent, just close the connection
+        res.end();
+      }
+    });
+    
+    // AI-NOTE: [FIXED] Track premature stream abortion
+    proxyRes.on('aborted', () => {
+      log('error', 'Response stream aborted', { 
+        targetUrl,
+        hostname: options.hostname 
+      });
+      if (!res.finished) {
+        res.end();
+      }
+    });
+    
+    // AI-NOTE: [DEBUG] Log stream completion for debugging
+    proxyRes.on('end', () => {
+      log('debug', 'Response stream ended', { 
+        targetUrl,
+        hostname: options.hostname 
+      });
+    });
   });
 
   proxyReq.on('error', (err) => {
@@ -200,11 +242,33 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     if (!res.headersSent) {
       res.writeHead(502, { 'Content-Type': 'text/plain' });
       res.end('Proxy error: ' + err.message);
+    } else {
+      res.end();
     }
   });
 
-  // Forward request body
-  req.pipe(proxyReq);
+  // AI-NOTE: [FIXED] Explicitly set { end: true } for proper request stream completion
+  req.pipe(proxyReq, { end: true });
+  
+  // AI-NOTE: [FIXED] Handle incoming request stream errors
+  req.on('error', (err) => {
+    log('error', 'Request stream error', {
+      error: err.message,
+      code: (err as any).code,
+      targetUrl,
+      hostname: options.hostname
+    });
+    proxyReq.destroy();
+  });
+  
+  // AI-NOTE: [FIXED] Handle client request abortion
+  req.on('aborted', () => {
+    log('info', 'Client request aborted', { 
+      targetUrl,
+      hostname: options.hostname 
+    });
+    proxyReq.destroy();
+  });
 
   // Timeout (configurable via PROXY_TIMEOUT_MS)
   proxyReq.setTimeout(PROXY_TIMEOUT_MS, () => {
@@ -305,9 +369,11 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
         targetSocket.write(head);
       }
       
-      // Start data tunneling
-      targetSocket.pipe(clientSocket, { end: false });
-      clientSocket.pipe(targetSocket, { end: false });
+      // AI-NOTE: [FIXED] Start data tunneling with proper stream completion
+      // Removed { end: false } to ensure streams are properly closed and all data is transferred
+      // This fixes IncompleteRead issues when downloading files through HTTPS tunnels (e.g., Google Slides images)
+      targetSocket.pipe(clientSocket);
+      clientSocket.pipe(targetSocket);
     });
 
     targetSocket.on('error', (err) => {
