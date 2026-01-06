@@ -22,6 +22,69 @@ const ALLOWED_IPS = process.env.ALLOWED_IPS?.split(',').map(ip => ip.trim()).fil
 // AI-NOTE: Request timeout in milliseconds (default: 20 minutes for slow LLM models with thinking mode)
 // Can be set via PROXY_TIMEOUT_MS environment variable
 const PROXY_TIMEOUT_MS = parseInt(process.env.PROXY_TIMEOUT_MS || '1200000', 10); // 20 minutes default
+// AI-NOTE: Rate limiting only for failed authentication attempts (brute force protection)
+// Successful authenticated requests are not rate limited to allow high-frequency LLM requests and streaming
+const AUTH_FAIL_RATE_LIMIT_WINDOW_MS = parseInt(process.env.AUTH_FAIL_RATE_LIMIT_WINDOW_MS || '300000', 10); // 5 minutes default
+const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parseInt(process.env.AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS || '10', 10); // 10 failed attempts per 5 minutes default
+
+// Rate limiting: track failed authentication attempts per IP (brute force protection)
+const authFailRateLimitMap = new Map<string, { count: number; resetTime: number; blockedUntil?: number }>();
+
+// Clean up old rate limit entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of authFailRateLimitMap.entries()) {
+    if (now > data.resetTime && (!data.blockedUntil || now > data.blockedUntil)) {
+      authFailRateLimitMap.delete(ip);
+    }
+  }
+}, 60000); // Clean up every minute
+
+// Check if IP is blocked due to too many failed authentication attempts
+function checkAuthFailRateLimit(clientIP: string): boolean {
+  const now = Date.now();
+  const entry = authFailRateLimitMap.get(clientIP);
+  
+  // If IP is temporarily blocked, deny access
+  if (entry?.blockedUntil && now < entry.blockedUntil) {
+    return false;
+  }
+  
+  // If entry exists but block period expired, reset it
+  if (entry && now > entry.resetTime && (!entry.blockedUntil || now > entry.blockedUntil)) {
+    authFailRateLimitMap.delete(clientIP);
+  }
+  
+  return true;
+}
+
+// Record failed authentication attempt
+function recordAuthFailure(clientIP: string): void {
+  const now = Date.now();
+  const entry = authFailRateLimitMap.get(clientIP);
+  
+  if (!entry || now > entry.resetTime) {
+    // First failure or window expired - start new window
+    authFailRateLimitMap.set(clientIP, { 
+      count: 1, 
+      resetTime: now + AUTH_FAIL_RATE_LIMIT_WINDOW_MS 
+    });
+  } else {
+    // Increment failure count
+    entry.count++;
+    
+    // If too many failures, block IP temporarily
+    if (entry.count >= AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS) {
+      const blockDuration = Math.min(AUTH_FAIL_RATE_LIMIT_WINDOW_MS * 2, 3600000); // Max 1 hour
+      entry.blockedUntil = now + blockDuration;
+      log('info', 'IP temporarily blocked due to too many failed auth attempts', {
+        clientIP,
+        failures: entry.count,
+        blockedUntil: new Date(entry.blockedUntil).toISOString()
+      });
+    }
+  }
+}
 
 // Logging
 function log(level: 'info' | 'debug' | 'error', message: string, data?: any) {
@@ -193,13 +256,34 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       return;
     }
 
+    // Check if IP is blocked due to too many failed auth attempts (brute force protection)
+    if (!checkAuthFailRateLimit(clientIP)) {
+      const entry = authFailRateLimitMap.get(clientIP);
+      log('info', 'Blocked IP (too many failed auth attempts)', { 
+        clientIP,
+        blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
+      });
+      clientSocket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+      clientSocket.end();
+      return;
+    }
+
     // Authentication check
     const authHeader = req.headers['proxy-authorization'];
     if (!checkAuth(authHeader)) {
-      log('error', 'Authentication failed', { clientIP });
+      // Record failed authentication attempt
+      recordAuthFailure(clientIP);
+      // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
+      log('debug', 'Authentication failed', { clientIP });
       clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Sami LLM Proxy"\r\n\r\n');
       clientSocket.end();
       return;
+    }
+    
+    // AI-NOTE: Successful authentication - clear any previous failures for this IP
+    // This allows legitimate users to recover quickly if they made mistakes
+    if (authFailRateLimitMap.has(clientIP)) {
+      authFailRateLimitMap.delete(clientIP);
     }
 
     log('info', 'HTTPS tunnel request', { hostname, port, clientIP });
@@ -316,16 +400,37 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     return;
   }
 
+  // Check if IP is blocked due to too many failed auth attempts (brute force protection)
+  if (!checkAuthFailRateLimit(clientIP)) {
+    const entry = authFailRateLimitMap.get(clientIP);
+    log('info', 'Blocked IP (too many failed auth attempts)', { 
+      clientIP,
+      blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
+    });
+    res.writeHead(429, { 'Content-Type': 'text/plain' });
+    res.end('Too Many Requests');
+    return;
+  }
+
   // Authentication check
   const authHeader = req.headers['proxy-authorization'];
   if (!checkAuth(authHeader)) {
-    log('error', 'Authentication failed', { clientIP });
+    // Record failed authentication attempt
+    recordAuthFailure(clientIP);
+    // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
+    log('debug', 'Authentication failed', { clientIP });
     res.writeHead(407, {
       'Content-Type': 'text/plain',
       'Proxy-Authenticate': 'Basic realm="Sami LLM Proxy"'
     });
     res.end('Proxy authentication required');
     return;
+  }
+  
+  // AI-NOTE: Successful authentication - clear any previous failures for this IP
+  // This allows legitimate users to recover quickly if they made mistakes
+  if (authFailRateLimitMap.has(clientIP)) {
+    authFailRateLimitMap.delete(clientIP);
   }
 
   // AI-NOTE: CONNECT requests are handled in 'connect' event above
@@ -399,10 +504,24 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     });
     
     netSocket.on('error', (err) => {
-      log('error', 'Socket error', {
-        remoteAddress: netSocket.remoteAddress,
-        error: err.message
-      });
+      const errorCode = (err as any).code;
+      const knownConnectionErrors = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT'];
+      const isKnownError = knownConnectionErrors.includes(errorCode);
+      
+      // Log known connection errors as debug (common from bots)
+      if (isKnownError) {
+        log('debug', 'Socket error (likely bot/scanner)', {
+          remoteAddress: netSocket.remoteAddress,
+          error: err.message,
+          code: errorCode
+        });
+      } else {
+        log('error', 'Socket error', {
+          remoteAddress: netSocket.remoteAddress,
+          error: err.message,
+          code: errorCode
+        });
+      }
     });
   });
 
@@ -414,7 +533,8 @@ server.listen(PROXY_PORT, PROXY_ADDRESS, () => {
     auth: PROXY_AUTH_USERNAME ? 'enabled' : 'disabled',
     allowedIPs: ALLOWED_IPS.length > 0 ? ALLOWED_IPS : 'all',
     logLevel: LOG_LEVEL,
-    timeout: `${PROXY_TIMEOUT_MS}ms (${Math.round(PROXY_TIMEOUT_MS / 60000)} minutes)`
+    timeout: `${PROXY_TIMEOUT_MS}ms (${Math.round(PROXY_TIMEOUT_MS / 60000)} minutes)`,
+    bruteForceProtection: `${AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS} failed auth attempts per ${AUTH_FAIL_RATE_LIMIT_WINDOW_MS / 1000}s (authenticated requests unlimited)`
   });
 });
 
@@ -427,11 +547,44 @@ server.on('error', (err) => {
 
 server.on('clientError', (err, socket) => {
   const netSocket = socket as net.Socket;
-  log('error', 'Client error', {
-    error: err.message,
-    code: (err as any).code,
-    remoteAddress: netSocket.remoteAddress
-  });
+  const errorCode = (err as any).code;
+  const remoteAddress = netSocket.remoteAddress || 'unknown';
+  
+  // AI-NOTE: Many parse errors are from bots/scanners sending malformed requests
+  // These are expected on a public proxy server, so log as debug instead of error
+  const knownBotErrors = [
+    'HPE_PAUSED_H2_UPGRADE',      // HTTP/2 upgrade attempts
+    'HPE_INVALID_METHOD',         // Invalid HTTP method
+    'HPE_INVALID_CONSTANT',       // Invalid HTTP constant
+    'HPE_UNEXPECTED_CONTENT_LENGTH', // Unexpected content length
+    'ECONNRESET',                 // Connection reset by client
+    'EPIPE',                      // Broken pipe
+    'ETIMEDOUT'                   // Connection timeout
+  ];
+  
+  const isKnownBotError = knownBotErrors.some(code => 
+    errorCode === code || err.message.includes(code)
+  );
+  
+  // Log known bot errors as debug, others as error
+  if (isKnownBotError) {
+    log('debug', 'Client error (likely bot/scanner)', {
+      error: err.message,
+      code: errorCode,
+      remoteAddress
+    });
+  } else {
+    log('error', 'Client error', {
+      error: err.message,
+      code: errorCode,
+      remoteAddress
+    });
+  }
+  
+  // Close the socket
+  if (!netSocket.destroyed) {
+    netSocket.destroy();
+  }
 });
 
 // Graceful shutdown
