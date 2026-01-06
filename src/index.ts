@@ -31,7 +31,8 @@ const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parseInt(process.env.AUTH_FAIL_RATE_LI
 const authFailRateLimitMap = new Map<string, { count: number; resetTime: number; blockedUntil?: number }>();
 
 // Clean up old rate limit entries periodically
-setInterval(() => {
+// AI-NOTE: [FIXED] Store interval reference for cleanup on shutdown
+const rateLimitCleanupInterval = setInterval(() => {
   const now = Date.now();
   for (const [ip, data] of authFailRateLimitMap.entries()) {
     if (now > data.resetTime && (!data.blockedUntil || now > data.blockedUntil)) {
@@ -136,6 +137,16 @@ function checkIP(clientIP: string): boolean {
 function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, targetUrl: string) {
   const parsedUrl = parseUrl(targetUrl);
   
+  // AI-NOTE: [FIXED] Validate parsed URL and hostname
+  if (!parsedUrl || !parsedUrl.hostname) {
+    log('error', 'Invalid target URL', { targetUrl, clientIP: req.socket.remoteAddress || 'unknown' });
+    if (!res.headersSent) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Bad Request: Invalid target URL');
+    }
+    return;
+  }
+  
   // AI-NOTE: [ERROR PROTECTION] If port is 443, it's always HTTPS, even if protocol is specified as http://
   // In normal operation, HttpsProxyAgent uses CONNECT for HTTPS requests (handled above, lines 180-236)
   // This code is needed for:
@@ -146,12 +157,14 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   const isHttps = parsedUrl.protocol === 'https:' || port === 443;
   const client = isHttps ? https : http;
   
+  // AI-NOTE: [FIXED] Validate port is a valid number
+  const finalPort = (port && !isNaN(port) && port > 0 && port <= 65535) ? port : (isHttps ? 443 : 80);
+  
   // AI-NOTE: For HTTP proxy, path must be full (including query string)
   const path = parsedUrl.path || '/';
   const fullPath = parsedUrl.search ? `${path}${parsedUrl.search}` : path;
   
   // AI-NOTE: [FIXED] Correctly determine port and host header
-  const finalPort = port || (isHttps ? 443 : 80);
   const hostHeader = parsedUrl.host || `${parsedUrl.hostname}:${finalPort}`;
   
   const options = {
@@ -170,15 +183,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   delete (options.headers as any)['proxy-connection'];
   delete (options.headers as any)['connection'];
 
-  // AI-NOTE: [INFO] Log target domain for monitoring and statistics
-  log('info', 'Proxying request to domain', {
-    domain: options.hostname,
-    port: options.port,
-    method: options.method,
-    isHttps,
-    clientIP: (req.socket.remoteAddress || 'unknown')
-  });
-  
+  // AI-NOTE: Domain logging is done in request handler to avoid duplication
   log('debug', 'Making proxy request', {
     hostname: options.hostname,
     port: options.port,
@@ -211,12 +216,20 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
         port: options.port
       });
       // If headers not sent yet, send error response
-      if (!res.headersSent) {
-        res.writeHead(502, { 'Content-Type': 'text/plain' });
-        res.end('Response stream error: ' + err.message);
-      } else {
-        // Headers already sent, just close the connection
-        res.end();
+      if (!res.headersSent && !res.destroyed) {
+        try {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Response stream error: ' + err.message);
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      } else if (!res.destroyed && !res.finished) {
+        // Headers already sent, just close the connection safely
+        try {
+          res.end();
+        } catch (endErr) {
+          log('debug', 'Failed to end response', { error: endErr });
+        }
       }
     });
     
@@ -226,8 +239,12 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
         targetUrl,
         hostname: options.hostname 
       });
-      if (!res.finished) {
-        res.end();
+      if (!res.finished && !res.destroyed) {
+        try {
+          res.end();
+        } catch (endErr) {
+          log('debug', 'Failed to end aborted response', { error: endErr });
+        }
       }
     });
     
@@ -248,11 +265,19 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       hostname: options.hostname,
       port: options.port
     });
-    if (!res.headersSent) {
-      res.writeHead(502, { 'Content-Type': 'text/plain' });
-      res.end('Proxy error: ' + err.message);
-    } else {
-      res.end();
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Proxy error: ' + err.message);
+      } catch (writeErr) {
+        log('debug', 'Failed to write proxy error response', { error: writeErr });
+      }
+    } else if (!res.destroyed && !res.finished) {
+      try {
+        res.end();
+      } catch (endErr) {
+        log('debug', 'Failed to end proxy error response', { error: endErr });
+      }
     }
   });
 
@@ -288,9 +313,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       port: options.port
     });
     proxyReq.destroy();
-    if (!res.headersSent) {
-      res.writeHead(504, { 'Content-Type': 'text/plain' });
-      res.end('Gateway Timeout');
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(504, { 'Content-Type': 'text/plain' });
+        res.end('Gateway Timeout');
+      } catch (writeErr) {
+        log('debug', 'Failed to write timeout response', { error: writeErr });
+      }
     }
   });
 }
@@ -304,8 +333,43 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     const netSocket = clientSocket as net.Socket;
     const clientIP = netSocket.remoteAddress || 'unknown';
     const targetUrl = req.url || '';
-    const [hostname, portStr] = targetUrl.split(':');
-    const port = portStr ? parseInt(portStr, 10) : 443;
+    
+    // AI-NOTE: [FIXED] Proper parsing of CONNECT target supporting IPv6 format [hostname]:port
+    let hostname: string;
+    let port: number;
+    
+    if (targetUrl.startsWith('[')) {
+      // IPv6 format: [hostname]:port
+      const closingBracket = targetUrl.indexOf(']');
+      if (closingBracket === -1 || targetUrl[closingBracket + 1] !== ':') {
+        log('error', 'Invalid CONNECT target (IPv6 format)', { targetUrl, clientIP });
+        clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+        clientSocket.end();
+        return;
+      }
+      hostname = targetUrl.substring(1, closingBracket);
+      const portStr = targetUrl.substring(closingBracket + 2);
+      port = portStr ? parseInt(portStr, 10) : 443;
+    } else {
+      // IPv4 format: hostname:port
+      const lastColon = targetUrl.lastIndexOf(':');
+      if (lastColon === -1) {
+        hostname = targetUrl;
+        port = 443;
+      } else {
+        hostname = targetUrl.substring(0, lastColon);
+        const portStr = targetUrl.substring(lastColon + 1);
+        port = portStr ? parseInt(portStr, 10) : 443;
+      }
+    }
+    
+    // AI-NOTE: [FIXED] Validate port is a valid number
+    if (isNaN(port) || port < 1 || port > 65535) {
+      log('error', 'Invalid CONNECT port', { targetUrl, port, clientIP });
+      clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+      clientSocket.end();
+      return;
+    }
 
     log('info', 'CONNECT request received', {
       hostname,
@@ -314,8 +378,8 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       url: targetUrl
     });
 
-    if (!hostname) {
-      log('error', 'Invalid CONNECT target', { targetUrl, clientIP });
+    if (!hostname || hostname.length === 0) {
+      log('error', 'Invalid CONNECT target (empty hostname)', { targetUrl, clientIP });
       clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
       clientSocket.end();
       return;
@@ -447,15 +511,34 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     const clientIP = req.socket.remoteAddress || 'unknown';
     
     // AI-NOTE: Health check endpoint for monitoring
-    if (req.url === '/health' || req.url === '/status') {
-      log('debug', 'Health check request', { clientIP });
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        version: '1.0.0'
-      }));
+    // AI-NOTE: [FIXED] Handle query string and validate HTTP method
+    const urlPath = req.url?.split('?')[0]; // Remove query string if present
+    if (urlPath === '/health' || urlPath === '/status') {
+      // Only allow GET and HEAD methods for health check
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        res.writeHead(405, { 'Content-Type': 'text/plain' });
+        res.end('Method Not Allowed');
+        return;
+      }
+      
+      log('debug', 'Health check request', { clientIP, method: req.method });
+      
+      try {
+        const uptime = process.uptime();
+        const healthData = {
+          status: 'ok',
+          timestamp: new Date().toISOString(),
+          uptime: isNaN(uptime) ? 0 : uptime,
+          version: '1.0.0'
+        };
+        
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(healthData));
+      } catch (err) {
+        log('error', 'Health check error', { error: (err as Error).message, clientIP });
+        res.writeHead(500, { 'Content-Type': 'text/plain' });
+        res.end('Internal Server Error');
+      }
       return;
     }
     
@@ -695,19 +778,26 @@ server.on('clientError', (err, socket) => {
 });
 
 // Graceful shutdown
-process.on('SIGTERM', () => {
-  log('info', 'SIGTERM received, shutting down gracefully');
+function gracefulShutdown(signal: string) {
+  log('info', `${signal} received, shutting down gracefully`);
+  
+  // AI-NOTE: [FIXED] Clear rate limit cleanup interval
+  if (rateLimitCleanupInterval) {
+    clearInterval(rateLimitCleanupInterval);
+  }
+  
   server.close(() => {
     log('info', 'Server closed');
     process.exit(0);
   });
-});
+  
+  // Force exit after timeout if graceful shutdown fails
+  setTimeout(() => {
+    log('error', 'Forced shutdown after timeout');
+    process.exit(1);
+  }, 10000); // 10 seconds timeout
+}
 
-process.on('SIGINT', () => {
-  log('info', 'SIGINT received, shutting down gracefully');
-  server.close(() => {
-    log('info', 'Server closed');
-    process.exit(0);
-  });
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
