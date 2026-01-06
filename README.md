@@ -6,6 +6,7 @@ A lightweight HTTP/HTTPS proxy server for routing LLM API requests through a neu
 
 - ✅ **HTTP/HTTPS Proxy** - Standard HTTP proxy protocol with CONNECT method support
 - ✅ **Basic Authentication** - Optional username/password protection
+- ✅ **Brute Force Protection** - Automatic IP blocking after failed authentication attempts
 - ✅ **IP Filtering** - Restrict access by IP addresses
 - ✅ **Configurable Logging** - Control log verbosity (error, info, debug)
 - ✅ **Docker Ready** - Pre-configured for easy deployment
@@ -80,6 +81,8 @@ docker-compose up -d
 | `LOG_LEVEL` | `info` | Logging level: `error`, `info`, or `debug` |
 | `ALLOWED_IPS` | - | Comma-separated list of allowed IP addresses |
 | `PROXY_TIMEOUT_MS` | `1200000` | Request timeout in milliseconds (default: 20 minutes). Increase for slow LLM models with thinking mode |
+| `AUTH_FAIL_RATE_LIMIT_WINDOW_MS` | `300000` | Time window in milliseconds for counting failed authentication attempts (default: 5 minutes) |
+| `AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS` | `10` | Maximum failed authentication attempts before IP is temporarily blocked (default: 10 attempts per window). Authenticated requests are not rate limited |
 
 ### Example: With Authentication
 
@@ -212,9 +215,10 @@ docker logs --tail 100 sami-llm-proxy
 
 1. **Use HTTPS** - Set up a reverse proxy (Nginx/Caddy) with SSL/TLS
 2. **Enable Authentication** - Always set `PROXY_AUTH_USERNAME` and `PROXY_AUTH_PASSWORD`
-3. **Restrict IPs** - Use `ALLOWED_IPS` to limit access
-4. **Firewall** - Configure firewall rules to restrict access
-5. **Keep Updated** - Regularly pull the latest image
+3. **Brute Force Protection** - Enabled by default (10 failed attempts per 5 minutes). Adjust `AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS` and `AUTH_FAIL_RATE_LIMIT_WINDOW_MS` if needed
+4. **Restrict IPs** - Use `ALLOWED_IPS` to limit access
+5. **Firewall** - Configure firewall rules to restrict access
+6. **Keep Updated** - Regularly pull the latest image
 
 ## Building from Source
 
