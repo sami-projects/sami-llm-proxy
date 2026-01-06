@@ -54,6 +54,12 @@ const PROXY_TIMEOUT_MS = parseTimeout(process.env.PROXY_TIMEOUT_MS, 1200000, 'PR
 // Successful authenticated requests are not rate limited to allow high-frequency LLM requests and streaming
 const AUTH_FAIL_RATE_LIMIT_WINDOW_MS = parseTimeout(process.env.AUTH_FAIL_RATE_LIMIT_WINDOW_MS, 300000, 'AUTH_FAIL_RATE_LIMIT_WINDOW_MS'); // 5 minutes default
 const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parsePositiveInt(process.env.AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS, 10, 'AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS'); // 10 failed attempts per 5 minutes default
+// AI-NOTE: [FIXED] DoS protection - limit maximum concurrent connections
+// Large limit (50000) to allow high load but prevent connection flooding attacks
+const MAX_CONCURRENT_CONNECTIONS = parsePositiveInt(process.env.MAX_CONCURRENT_CONNECTIONS, 50000, 'MAX_CONCURRENT_CONNECTIONS'); // 50000 default
+// AI-NOTE: [FIXED] DoS protection - limit maximum URL length
+// Large limit (16384 = 16KB) to allow long URLs but prevent memory exhaustion attacks
+const MAX_URL_LENGTH = parsePositiveInt(process.env.MAX_URL_LENGTH, 16384, 'MAX_URL_LENGTH'); // 16384 characters default
 
 // Rate limiting: track failed authentication attempts per IP (brute force protection)
 // AI-NOTE: [FIXED] Add maximum size limit to prevent memory exhaustion DoS
@@ -442,12 +448,33 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
   // Request handling
   const server = http.createServer();
   
+  // AI-NOTE: [FIXED] Set maximum concurrent connections to prevent DoS attacks
+  server.maxConnections = MAX_CONCURRENT_CONNECTIONS;
+  
   // AI-NOTE: [CRITICAL] For CONNECT requests, Node.js uses special 'connect' event
   // This event is called BEFORE http.createServer handler for CONNECT requests
   server.on('connect', (req, clientSocket, head) => {
     const netSocket = clientSocket as net.Socket;
     const clientIP = netSocket.remoteAddress || 'unknown';
     const targetUrl = req.url || '';
+    
+    // AI-NOTE: [FIXED] Validate URL length to prevent DoS attacks
+    if (targetUrl.length > MAX_URL_LENGTH) {
+      log('error', 'CONNECT target URL too long', { 
+        targetUrlLength: targetUrl.length, 
+        maxLength: MAX_URL_LENGTH,
+        clientIP 
+      });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 414 URI Too Long\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
     
     // AI-NOTE: [FIXED] Proper parsing of CONNECT target supporting IPv6 format [hostname]:port
     let hostname: string;
@@ -858,6 +885,24 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     return;
   }
 
+  // AI-NOTE: [FIXED] Validate URL length to prevent DoS attacks
+  if (req.url.length > MAX_URL_LENGTH) {
+    log('error', 'Request URL too long', { 
+      urlLength: req.url.length, 
+      maxLength: MAX_URL_LENGTH,
+      clientIP 
+    });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(414, { 'Content-Type': 'text/plain' });
+        res.end('URI Too Long');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
   let targetUrl: string;
   
   // If this is a full URL (starts with http:// or https://)
@@ -974,7 +1019,9 @@ server.listen(PROXY_PORT, PROXY_ADDRESS, () => {
     allowedIPs: ALLOWED_IPS.length > 0 ? ALLOWED_IPS : 'all',
     logLevel: LOG_LEVEL,
     timeout: `${PROXY_TIMEOUT_MS}ms (${Math.round(PROXY_TIMEOUT_MS / 60000)} minutes)`,
-    bruteForceProtection: `${AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS} failed auth attempts per ${AUTH_FAIL_RATE_LIMIT_WINDOW_MS / 1000}s (authenticated requests unlimited)`
+    bruteForceProtection: `${AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS} failed auth attempts per ${AUTH_FAIL_RATE_LIMIT_WINDOW_MS / 1000}s (authenticated requests unlimited)`,
+    maxConnections: MAX_CONCURRENT_CONNECTIONS,
+    maxUrlLength: MAX_URL_LENGTH
   });
 });
 

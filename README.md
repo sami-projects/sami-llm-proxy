@@ -85,6 +85,8 @@ docker-compose up -d
 | `PROXY_TIMEOUT_MS` | `1200000` | Request timeout in milliseconds (default: 20 minutes). Increase for slow LLM models with thinking mode |
 | `AUTH_FAIL_RATE_LIMIT_WINDOW_MS` | `300000` | Time window in milliseconds for counting failed authentication attempts (default: 5 minutes) |
 | `AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS` | `10` | Maximum failed authentication attempts before IP is temporarily blocked (default: 10 attempts per window). Authenticated requests are not rate limited |
+| `MAX_CONCURRENT_CONNECTIONS` | `50000` | Maximum number of concurrent connections (DoS protection). Large limit to allow high load |
+| `MAX_URL_LENGTH` | `16384` | Maximum URL length in characters (DoS protection). Large limit (16KB) to allow long URLs but prevent memory exhaustion |
 
 ### Example: With Authentication
 
