@@ -291,7 +291,8 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     log('debug', 'Proxy response received', {
       statusCode: proxyRes.statusCode,
       headers: Object.keys(proxyRes.headers),
-      contentLength: proxyRes.headers['content-length']
+      contentLength: proxyRes.headers['content-length'],
+      transferEncoding: proxyRes.headers['transfer-encoding']
     });
     
     // AI-NOTE: [FIXED] Check response state before writing headers and piping
@@ -301,8 +302,21 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       return;
     }
     
+    // AI-NOTE: [FIXED] Normalize response headers to prevent issues with arrays or invalid values
+    // Node.js http.ServerResponse.writeHead() expects headers as Record<string, string | string[]>
+    // But some headers might be arrays, so we need to handle them properly
+    const responseHeaders: Record<string, string | string[]> = {};
+    for (const [key, value] of Object.entries(proxyRes.headers)) {
+      if (value !== undefined) {
+        // If value is already an array, use it as is
+        // If value is a string, use it as is
+        // This ensures compatibility with Node.js writeHead()
+        responseHeaders[key] = value;
+      }
+    }
+    
     try {
-      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      res.writeHead(proxyRes.statusCode || 200, responseHeaders);
     } catch (writeErr) {
       log('error', 'Failed to write response headers', { 
         error: (writeErr as Error).message,
@@ -312,6 +326,44 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       return;
     }
     
+    // AI-NOTE: [FIXED] CRITICAL: Handle client connection close during data transfer
+    // If client closes connection while receiving large response, we must stop proxyRes
+    // This prevents "Premature close" errors and resource leaks
+    let clientConnectionClosed = false;
+    const handleClientClose = () => {
+      if (!clientConnectionClosed) {
+        clientConnectionClosed = true;
+        log('info', 'Client connection closed during response transfer', {
+          targetUrl,
+          hostname: options.hostname,
+          headersSent: res.headersSent,
+          finished: res.finished
+        });
+        // Stop receiving data from proxyRes to prevent errors
+        if (!proxyRes.destroyed) {
+          proxyRes.destroy();
+        }
+      }
+    };
+    
+    // AI-NOTE: [FIXED] Handle client response write errors
+    // If writing to client fails, stop receiving data from proxyRes
+    res.on('error', (err) => {
+      log('error', 'Client response write error', {
+        error: err.message,
+        code: (err as any).code,
+        targetUrl,
+        hostname: options.hostname
+      });
+      handleClientClose();
+    });
+    
+    // AI-NOTE: [FIXED] Handle client connection close
+    // This is critical for large responses - if client closes, we must stop proxyRes
+    res.on('close', () => {
+      handleClientClose();
+    });
+    
     // AI-NOTE: [FIXED] Explicitly set { end: true } for proper stream completion
     // This ensures all data is properly transferred and stream is closed correctly
     // Check state before piping to avoid errors
@@ -319,6 +371,7 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       proxyRes.pipe(res, { end: true });
     } else {
       proxyRes.destroy();
+      return;
     }
     
     // AI-NOTE: [FIXED] Handle response stream errors to prevent IncompleteRead issues
@@ -328,8 +381,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
         code: (err as any).code,
         targetUrl,
         hostname: options.hostname,
-        port: options.port
+        port: options.port,
+        clientConnectionClosed
       });
+      // Don't try to write to client if connection is already closed
+      if (clientConnectionClosed || res.destroyed) {
+        return;
+      }
       // If headers not sent yet, send error response
       if (!res.headersSent && !res.destroyed) {
         try {
@@ -352,8 +410,13 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
     proxyRes.on('aborted', () => {
       log('error', 'Response stream aborted', { 
         targetUrl,
-        hostname: options.hostname 
+        hostname: options.hostname,
+        clientConnectionClosed
       });
+      // Don't try to write to client if connection is already closed
+      if (clientConnectionClosed || res.destroyed) {
+        return;
+      }
       if (!res.finished && !res.destroyed) {
         try {
           res.end();
@@ -363,11 +426,34 @@ function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, t
       }
     });
     
+    // AI-NOTE: [FIXED] Handle premature close of proxyRes (server closed connection)
+    // This can happen if upstream server closes connection before sending all data
+    proxyRes.on('close', () => {
+      if (!proxyRes.readableEnded && !clientConnectionClosed) {
+        log('error', 'Proxy response closed prematurely (server closed connection)', {
+          targetUrl,
+          hostname: options.hostname,
+          headersSent: res.headersSent,
+          finished: res.finished
+        });
+        // If headers were sent but response not finished, client will see "Premature close"
+        // We can't do much here, but we log it for diagnostics
+        if (!res.finished && !res.destroyed) {
+          try {
+            res.end();
+          } catch (endErr) {
+            log('debug', 'Failed to end response after premature close', { error: endErr });
+          }
+        }
+      }
+    });
+    
     // AI-NOTE: [DEBUG] Log stream completion for debugging
     proxyRes.on('end', () => {
       log('debug', 'Response stream ended', { 
         targetUrl,
-        hostname: options.hostname 
+        hostname: options.hostname,
+        clientConnectionClosed
       });
     });
   });
