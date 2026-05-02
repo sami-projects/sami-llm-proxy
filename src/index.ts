@@ -1,0 +1,1199 @@
+/**
+ * Sami LLM Proxy Server
+ * 
+ * HTTP/HTTPS proxy server for routing requests to LLM providers
+ * 
+ * AI-NOTE: [CREATED] Simple and reproducible proxy server for deployment on any server
+ * Uses standard HTTP proxy protocol, compatible with https-proxy-agent
+ */
+
+import http from 'http';
+import https from 'https';
+import net from 'net';
+import { parse as parseUrl } from 'url';
+
+// Configuration from environment variables
+// AI-NOTE: [FIXED] Validate configuration values to prevent NaN and invalid ranges
+function parsePort(envVar: string | undefined, defaultPort: number, name: string): number {
+  const port = parseInt(envVar || String(defaultPort), 10);
+  if (isNaN(port) || port < 1 || port > 65535) {
+    console.error(`[ERROR] Invalid ${name} port: ${envVar}, using default: ${defaultPort}`);
+    return defaultPort;
+  }
+  return port;
+}
+
+function parseTimeout(envVar: string | undefined, defaultTimeout: number, name: string): number {
+  const timeout = parseInt(envVar || String(defaultTimeout), 10);
+  if (isNaN(timeout) || timeout < 1000 || timeout > 86400000) { // 1 second to 24 hours
+    console.error(`[ERROR] Invalid ${name} timeout: ${envVar}, using default: ${defaultTimeout}ms`);
+    return defaultTimeout;
+  }
+  return timeout;
+}
+
+function parsePositiveInt(envVar: string | undefined, defaultValue: number, name: string): number {
+  const value = parseInt(envVar || String(defaultValue), 10);
+  if (isNaN(value) || value < 1) {
+    console.error(`[ERROR] Invalid ${name}: ${envVar}, using default: ${defaultValue}`);
+    return defaultValue;
+  }
+  return value;
+}
+
+const PROXY_PORT = parsePort(process.env.PROXY_PORT, 8080, 'PROXY_PORT');
+const PROXY_ADDRESS = process.env.PROXY_ADDRESS || '0.0.0.0'; // AI-NOTE: 0.0.0.0 = listen on all interfaces (correct for Docker)
+const PROXY_AUTH_USERNAME = process.env.PROXY_AUTH_USERNAME;
+const PROXY_AUTH_PASSWORD = process.env.PROXY_AUTH_PASSWORD;
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // AI-NOTE: Default is info
+const ALLOWED_IPS = process.env.ALLOWED_IPS?.split(',').map(ip => ip.trim()).filter(Boolean) || [];
+// AI-NOTE: Request timeout in milliseconds (default: 20 minutes for slow LLM models with thinking mode)
+// Can be set via PROXY_TIMEOUT_MS environment variable
+const PROXY_TIMEOUT_MS = parseTimeout(process.env.PROXY_TIMEOUT_MS, 1200000, 'PROXY_TIMEOUT_MS'); // 20 minutes default
+// AI-NOTE: Rate limiting only for failed authentication attempts (brute force protection)
+// Successful authenticated requests are not rate limited to allow high-frequency LLM requests and streaming
+const AUTH_FAIL_RATE_LIMIT_WINDOW_MS = parseTimeout(process.env.AUTH_FAIL_RATE_LIMIT_WINDOW_MS, 300000, 'AUTH_FAIL_RATE_LIMIT_WINDOW_MS'); // 5 minutes default
+const AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS = parsePositiveInt(process.env.AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS, 10, 'AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS'); // 10 failed attempts per 5 minutes default
+// AI-NOTE: [FIXED] DoS protection - limit maximum concurrent connections
+// Large limit (50000) to allow high load but prevent connection flooding attacks
+const MAX_CONCURRENT_CONNECTIONS = parsePositiveInt(process.env.MAX_CONCURRENT_CONNECTIONS, 50000, 'MAX_CONCURRENT_CONNECTIONS'); // 50000 default
+// AI-NOTE: [FIXED] DoS protection - limit maximum URL length
+// Large limit (16384 = 16KB) to allow long URLs but prevent memory exhaustion attacks
+const MAX_URL_LENGTH = parsePositiveInt(process.env.MAX_URL_LENGTH, 16384, 'MAX_URL_LENGTH'); // 16384 characters default
+
+// Rate limiting: track failed authentication attempts per IP (brute force protection)
+// AI-NOTE: [FIXED] Add maximum size limit to prevent memory exhaustion DoS
+const MAX_RATE_LIMIT_MAP_SIZE = 10000; // Maximum number of IPs to track
+const authFailRateLimitMap = new Map<string, { count: number; resetTime: number; blockedUntil?: number }>();
+
+// Clean up old rate limit entries periodically
+// AI-NOTE: [FIXED] Store interval reference for cleanup on shutdown
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  
+  // Clean up expired entries
+  for (const [ip, data] of authFailRateLimitMap.entries()) {
+    if (now > data.resetTime && (!data.blockedUntil || now > data.blockedUntil)) {
+      authFailRateLimitMap.delete(ip);
+    }
+  }
+  
+  // AI-NOTE: [FIXED] If map is still too large, remove oldest entries (not blocked)
+  if (authFailRateLimitMap.size > MAX_RATE_LIMIT_MAP_SIZE) {
+    const entries = Array.from(authFailRateLimitMap.entries());
+    // Sort by resetTime (oldest first), but keep blocked entries
+    entries.sort((a, b) => {
+      if (a[1].blockedUntil && b[1].blockedUntil) {
+        return a[1].blockedUntil - b[1].blockedUntil;
+      }
+      if (a[1].blockedUntil) return 1; // Keep blocked entries
+      if (b[1].blockedUntil) return -1;
+      return a[1].resetTime - b[1].resetTime;
+    });
+    
+    // Remove oldest non-blocked entries
+    const toRemove = authFailRateLimitMap.size - MAX_RATE_LIMIT_MAP_SIZE;
+    for (let i = 0; i < toRemove && i < entries.length; i++) {
+      if (!entries[i][1].blockedUntil) {
+        authFailRateLimitMap.delete(entries[i][0]);
+      }
+    }
+  }
+}, 60000); // Clean up every minute
+
+// Check if IP is blocked due to too many failed authentication attempts
+function checkAuthFailRateLimit(clientIP: string): boolean {
+  const now = Date.now();
+  const entry = authFailRateLimitMap.get(clientIP);
+  
+  // If IP is temporarily blocked, deny access
+  if (entry?.blockedUntil && now < entry.blockedUntil) {
+    return false;
+  }
+  
+  // If entry exists but block period expired, reset it
+  if (entry && now > entry.resetTime && (!entry.blockedUntil || now > entry.blockedUntil)) {
+    authFailRateLimitMap.delete(clientIP);
+  }
+  
+  return true;
+}
+
+// Record failed authentication attempt
+function recordAuthFailure(clientIP: string): void {
+  // AI-NOTE: [FIXED] Prevent DoS by limiting map size
+  // If map is full and IP is not already tracked, don't add it
+  if (authFailRateLimitMap.size >= MAX_RATE_LIMIT_MAP_SIZE && !authFailRateLimitMap.has(clientIP)) {
+    log('debug', 'Rate limit map full, skipping new IP', { clientIP, mapSize: authFailRateLimitMap.size });
+    return;
+  }
+  
+  const now = Date.now();
+  const entry = authFailRateLimitMap.get(clientIP);
+  
+  if (!entry || now > entry.resetTime) {
+    // First failure or window expired - start new window
+    authFailRateLimitMap.set(clientIP, { 
+      count: 1, 
+      resetTime: now + AUTH_FAIL_RATE_LIMIT_WINDOW_MS 
+    });
+  } else {
+    // Increment failure count
+    entry.count++;
+    
+    // If too many failures, block IP temporarily
+    if (entry.count >= AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS) {
+      const blockDuration = Math.min(AUTH_FAIL_RATE_LIMIT_WINDOW_MS * 2, 3600000); // Max 1 hour
+      entry.blockedUntil = now + blockDuration;
+      log('info', 'IP temporarily blocked due to too many failed auth attempts', {
+        clientIP,
+        failures: entry.count,
+        blockedUntil: new Date(entry.blockedUntil).toISOString()
+      });
+    }
+  }
+}
+
+// Logging
+function log(level: 'info' | 'debug' | 'error', message: string, data?: any) {
+  const levels: Record<string, number> = { error: 0, info: 1, debug: 2 };
+  const currentLevel = levels[LOG_LEVEL] ?? levels['info']; // AI-NOTE: Default to info if LOG_LEVEL is invalid (LOG_LEVEL is already normalized to lowercase)
+  const messageLevel = levels[level] ?? 0;
+  
+  // AI-NOTE: [FIXED] Log only if message level <= current level
+  // error (0) <= info (1) <= debug (2)
+  // Example: with LOG_LEVEL=info, error (0) and info (1) are logged, but not debug (2)
+  if (messageLevel <= currentLevel) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level.toUpperCase()}] ${message}`;
+    console.log(logMessage, data ? JSON.stringify(data, null, 2) : '');
+  }
+}
+
+// Basic Auth check
+function checkAuth(authHeader: string | undefined): boolean {
+  if (!PROXY_AUTH_USERNAME || !PROXY_AUTH_PASSWORD) {
+    return true; // Authentication not required
+  }
+
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    return false;
+  }
+
+  try {
+    const credentials = Buffer.from(authHeader.slice(6), 'base64').toString('utf-8');
+    // AI-NOTE: [FIXED] Handle passwords containing ':' character
+    // Split only on first ':' to support passwords with colons
+    const colonIndex = credentials.indexOf(':');
+    if (colonIndex === -1) {
+      return false; // Invalid format: no colon found
+    }
+    const username = credentials.substring(0, colonIndex);
+    const password = credentials.substring(colonIndex + 1);
+    return username === PROXY_AUTH_USERNAME && password === PROXY_AUTH_PASSWORD;
+  } catch {
+    return false;
+  }
+}
+
+// Allowed IP check
+function checkIP(clientIP: string): boolean {
+  if (ALLOWED_IPS.length === 0) {
+    return true; // No restrictions
+  }
+
+  // Extract IP from string (may be "::ffff:192.168.1.1" for IPv6)
+  const cleanIP = clientIP.replace(/^::ffff:/, '');
+  return ALLOWED_IPS.includes(cleanIP) || ALLOWED_IPS.includes(clientIP);
+}
+
+// Function to proxy HTTP request
+function proxyHttpRequest(req: http.IncomingMessage, res: http.ServerResponse, targetUrl: string) {
+  const parsedUrl = parseUrl(targetUrl);
+  
+  // AI-NOTE: [FIXED] Validate parsed URL and hostname
+  if (!parsedUrl || !parsedUrl.hostname) {
+    log('error', 'Invalid target URL', { targetUrl, clientIP: req.socket.remoteAddress || 'unknown' });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: Invalid target URL');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+  
+  // AI-NOTE: [ERROR PROTECTION] If port is 443, it's always HTTPS, even if protocol is specified as http://
+  // In normal operation, HttpsProxyAgent uses CONNECT for HTTPS requests (handled above, lines 180-236)
+  // This code is needed for:
+  // 1. Protection against incorrect URLs (http://target:443) - fix to HTTPS
+  // 2. HTTP requests to servers on port 443 (rare case)
+  // 3. Security - all data to LLM must be encrypted
+  const port = parsedUrl.port ? parseInt(parsedUrl.port, 10) : (parsedUrl.protocol === 'https:' ? 443 : 80);
+  const isHttps = parsedUrl.protocol === 'https:' || port === 443;
+  const client = isHttps ? https : http;
+  
+  // AI-NOTE: [FIXED] Validate port is a valid number
+  const finalPort = (port && !isNaN(port) && port > 0 && port <= 65535) ? port : (isHttps ? 443 : 80);
+  
+  // AI-NOTE: For HTTP proxy, path must be full (including query string)
+  const path = parsedUrl.path || '/';
+  const fullPath = parsedUrl.search ? `${path}${parsedUrl.search}` : path;
+  
+  // AI-NOTE: [FIXED] Correctly determine port and host header
+  const hostHeader = parsedUrl.host || `${parsedUrl.hostname}:${finalPort}`;
+  
+  // AI-NOTE: [FIXED] Filter headers to prevent leaking internal/proxy headers
+  // Copy headers and remove proxy-specific and potentially dangerous headers
+  const filteredHeaders: Record<string, string | string[] | undefined> = {};
+  const headersToRemove = [
+    'proxy-authorization',
+    'proxy-connection',
+    'connection',
+    'upgrade',
+    'host', // Will be set explicitly
+    'transfer-encoding', // Let Node.js handle this
+    'content-length' // Let Node.js handle this for streaming
+  ];
+  
+  // Copy only safe headers
+  for (const [key, value] of Object.entries(req.headers)) {
+    const lowerKey = key.toLowerCase();
+    if (!headersToRemove.includes(lowerKey) && value !== undefined) {
+      filteredHeaders[key] = value;
+    }
+  }
+  
+  // Set correct host header
+  filteredHeaders['host'] = hostHeader;
+
+  const options = {
+    hostname: parsedUrl.hostname,
+    port: finalPort,
+    path: fullPath,
+    method: req.method,
+    headers: filteredHeaders
+  };
+
+  // AI-NOTE: Domain logging is done in request handler to avoid duplication
+  log('debug', 'Making proxy request', {
+    hostname: options.hostname,
+    port: options.port,
+    path: options.path,
+    method: options.method,
+    isHttps
+  });
+
+  const proxyReq = client.request(options, (proxyRes) => {
+    // Copy status and headers
+    log('debug', 'Proxy response received', {
+      statusCode: proxyRes.statusCode,
+      headers: Object.keys(proxyRes.headers),
+      contentLength: proxyRes.headers['content-length'],
+      transferEncoding: proxyRes.headers['transfer-encoding']
+    });
+    
+    // AI-NOTE: [FIXED] Check response state before writing headers and piping
+    if (res.destroyed || res.finished) {
+      log('debug', 'Response already closed, ignoring proxy response', { targetUrl });
+      proxyRes.destroy();
+      return;
+    }
+    
+    // AI-NOTE: [FIXED] Normalize response headers to prevent issues with arrays or invalid values
+    // Node.js http.ServerResponse.writeHead() expects headers as Record<string, string | string[]>
+    // But some headers might be arrays, so we need to handle them properly
+    const responseHeaders: Record<string, string | string[]> = {};
+    for (const [key, value] of Object.entries(proxyRes.headers)) {
+      if (value !== undefined) {
+        // If value is already an array, use it as is
+        // If value is a string, use it as is
+        // This ensures compatibility with Node.js writeHead()
+        responseHeaders[key] = value;
+      }
+    }
+    
+    try {
+      res.writeHead(proxyRes.statusCode || 200, responseHeaders);
+    } catch (writeErr) {
+      log('error', 'Failed to write response headers', { 
+        error: (writeErr as Error).message,
+        targetUrl 
+      });
+      proxyRes.destroy();
+      return;
+    }
+    
+    // AI-NOTE: [FIXED] CRITICAL: Handle client connection close during data transfer
+    // If client closes connection while receiving large response, we must stop proxyRes
+    // This prevents "Premature close" errors and resource leaks
+    let clientConnectionClosed = false;
+    const handleClientClose = () => {
+      if (!clientConnectionClosed) {
+        clientConnectionClosed = true;
+        log('info', 'Client connection closed during response transfer', {
+          targetUrl,
+          hostname: options.hostname,
+          headersSent: res.headersSent,
+          finished: res.finished
+        });
+        // Stop receiving data from proxyRes to prevent errors
+        if (!proxyRes.destroyed) {
+          proxyRes.destroy();
+        }
+      }
+    };
+    
+    // AI-NOTE: [FIXED] Handle client response write errors
+    // If writing to client fails, stop receiving data from proxyRes
+    res.on('error', (err) => {
+      log('error', 'Client response write error', {
+        error: err.message,
+        code: (err as any).code,
+        targetUrl,
+        hostname: options.hostname
+      });
+      handleClientClose();
+    });
+    
+    // AI-NOTE: [FIXED] Handle client connection close
+    // This is critical for large responses - if client closes, we must stop proxyRes
+    res.on('close', () => {
+      handleClientClose();
+    });
+    
+    // AI-NOTE: [FIXED] Explicitly set { end: true } for proper stream completion
+    // This ensures all data is properly transferred and stream is closed correctly
+    // Check state before piping to avoid errors
+    if (!res.destroyed) {
+      proxyRes.pipe(res, { end: true });
+    } else {
+      proxyRes.destroy();
+      return;
+    }
+    
+    // AI-NOTE: [FIXED] Handle response stream errors to prevent IncompleteRead issues
+    proxyRes.on('error', (err) => {
+      log('error', 'Response stream error', {
+        error: err.message,
+        code: (err as any).code,
+        targetUrl,
+        hostname: options.hostname,
+        port: options.port,
+        clientConnectionClosed
+      });
+      // Don't try to write to client if connection is already closed
+      if (clientConnectionClosed || res.destroyed) {
+        return;
+      }
+      // If headers not sent yet, send error response
+      if (!res.headersSent && !res.destroyed) {
+        try {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Response stream error: ' + err.message);
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      } else if (!res.destroyed && !res.finished) {
+        // Headers already sent, just close the connection safely
+        try {
+          res.end();
+        } catch (endErr) {
+          log('debug', 'Failed to end response', { error: endErr });
+        }
+      }
+    });
+    
+    // AI-NOTE: [FIXED] Track premature stream abortion
+    proxyRes.on('aborted', () => {
+      log('error', 'Response stream aborted', { 
+        targetUrl,
+        hostname: options.hostname,
+        clientConnectionClosed
+      });
+      // Don't try to write to client if connection is already closed
+      if (clientConnectionClosed || res.destroyed) {
+        return;
+      }
+      if (!res.finished && !res.destroyed) {
+        try {
+          res.end();
+        } catch (endErr) {
+          log('debug', 'Failed to end aborted response', { error: endErr });
+        }
+      }
+    });
+    
+    // AI-NOTE: [FIXED] Handle premature close of proxyRes (server closed connection)
+    // This can happen if upstream server closes connection before sending all data
+    proxyRes.on('close', () => {
+      if (!proxyRes.readableEnded && !clientConnectionClosed) {
+        log('error', 'Proxy response closed prematurely (server closed connection)', {
+          targetUrl,
+          hostname: options.hostname,
+          headersSent: res.headersSent,
+          finished: res.finished
+        });
+        // If headers were sent but response not finished, client will see "Premature close"
+        // We can't do much here, but we log it for diagnostics
+        if (!res.finished && !res.destroyed) {
+          try {
+            res.end();
+          } catch (endErr) {
+            log('debug', 'Failed to end response after premature close', { error: endErr });
+          }
+        }
+      }
+    });
+    
+    // AI-NOTE: [DEBUG] Log stream completion for debugging
+    proxyRes.on('end', () => {
+      log('debug', 'Response stream ended', { 
+        targetUrl,
+        hostname: options.hostname,
+        clientConnectionClosed
+      });
+    });
+  });
+
+  proxyReq.on('error', (err) => {
+    log('error', 'Proxy request error', { 
+      error: err.message, 
+      targetUrl,
+      code: (err as any).code,
+      hostname: options.hostname,
+      port: options.port
+    });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Proxy error: ' + err.message);
+      } catch (writeErr) {
+        log('debug', 'Failed to write proxy error response', { error: writeErr });
+      }
+    } else if (!res.destroyed && !res.finished) {
+      try {
+        res.end();
+      } catch (endErr) {
+        log('debug', 'Failed to end proxy error response', { error: endErr });
+      }
+    }
+  });
+
+  // AI-NOTE: [FIXED] Explicitly set { end: true } for proper request stream completion
+  // Check request state before piping
+  if (!req.destroyed && !req.complete) {
+    req.pipe(proxyReq, { end: true });
+  } else {
+    // Request already destroyed or completed, just end proxy request
+    proxyReq.end();
+  }
+  
+  // AI-NOTE: [FIXED] Handle incoming request stream errors
+  req.on('error', (err) => {
+    log('error', 'Request stream error', {
+      error: err.message,
+      code: (err as any).code,
+      targetUrl,
+      hostname: options.hostname
+    });
+    proxyReq.destroy();
+  });
+  
+  // AI-NOTE: [FIXED] Handle client request abortion
+  req.on('aborted', () => {
+    log('info', 'Client request aborted', { 
+      targetUrl,
+      hostname: options.hostname 
+    });
+    proxyReq.destroy();
+  });
+
+  // Timeout (configurable via PROXY_TIMEOUT_MS)
+  proxyReq.setTimeout(PROXY_TIMEOUT_MS, () => {
+    log('error', 'HTTP proxy request timeout', { 
+      timeout: PROXY_TIMEOUT_MS, 
+      targetUrl,
+      hostname: options.hostname,
+      port: options.port
+    });
+    proxyReq.destroy();
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(504, { 'Content-Type': 'text/plain' });
+        res.end('Gateway Timeout');
+      } catch (writeErr) {
+        log('debug', 'Failed to write timeout response', { error: writeErr });
+      }
+    }
+  });
+}
+
+  // Request handling
+  const server = http.createServer();
+  
+  // AI-NOTE: [FIXED] Set maximum concurrent connections to prevent DoS attacks
+  server.maxConnections = MAX_CONCURRENT_CONNECTIONS;
+  
+  // AI-NOTE: [CRITICAL] For CONNECT requests, Node.js uses special 'connect' event
+  // This event is called BEFORE http.createServer handler for CONNECT requests
+  server.on('connect', (req, clientSocket, head) => {
+    const netSocket = clientSocket as net.Socket;
+    const clientIP = netSocket.remoteAddress || 'unknown';
+    const targetUrl = req.url || '';
+    
+    // AI-NOTE: [FIXED] Validate URL length to prevent DoS attacks
+    if (targetUrl.length > MAX_URL_LENGTH) {
+      log('error', 'CONNECT target URL too long', { 
+        targetUrlLength: targetUrl.length, 
+        maxLength: MAX_URL_LENGTH,
+        clientIP 
+      });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 414 URI Too Long\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+    
+    // AI-NOTE: [FIXED] Proper parsing of CONNECT target supporting IPv6 format [hostname]:port
+    let hostname: string;
+    let port: number;
+    
+    if (targetUrl.startsWith('[')) {
+      // IPv6 format: [hostname]:port
+      const closingBracket = targetUrl.indexOf(']');
+      if (closingBracket === -1 || targetUrl[closingBracket + 1] !== ':') {
+        log('error', 'Invalid CONNECT target (IPv6 format)', { targetUrl, clientIP });
+        if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+          try {
+            clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+            clientSocket.end();
+          } catch (writeErr) {
+            log('debug', 'Failed to write error response', { error: writeErr });
+          }
+        }
+        return;
+      }
+      hostname = targetUrl.substring(1, closingBracket);
+      const portStr = targetUrl.substring(closingBracket + 2);
+      port = portStr ? parseInt(portStr, 10) : 443;
+    } else {
+      // IPv4 format: hostname:port
+      const lastColon = targetUrl.lastIndexOf(':');
+      if (lastColon === -1) {
+        hostname = targetUrl;
+        port = 443;
+      } else {
+        hostname = targetUrl.substring(0, lastColon);
+        const portStr = targetUrl.substring(lastColon + 1);
+        port = portStr ? parseInt(portStr, 10) : 443;
+      }
+    }
+    
+    // AI-NOTE: [FIXED] Validate port is a valid number
+    if (isNaN(port) || port < 1 || port > 65535) {
+      log('error', 'Invalid CONNECT port', { targetUrl, port, clientIP });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+
+    log('info', 'CONNECT request received', {
+      hostname,
+      port,
+      clientIP,
+      url: targetUrl
+    });
+
+    if (!hostname || hostname.length === 0) {
+      log('error', 'Invalid CONNECT target (empty hostname)', { targetUrl, clientIP });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+
+    // IP check
+    if (!checkIP(clientIP)) {
+      log('error', 'IP not allowed', { clientIP });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+
+    // Check if IP is blocked due to too many failed auth attempts (brute force protection)
+    if (!checkAuthFailRateLimit(clientIP)) {
+      const entry = authFailRateLimitMap.get(clientIP);
+      log('info', 'Blocked IP (too many failed auth attempts)', { 
+        clientIP,
+        blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
+      });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 429 Too Many Requests\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+
+    // Authentication check
+    const authHeader = req.headers['proxy-authorization'];
+    if (!checkAuth(authHeader)) {
+      // Record failed authentication attempt
+      recordAuthFailure(clientIP);
+      // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
+      log('debug', 'Authentication failed', { clientIP });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Sami LLM Proxy"\r\n\r\n');
+          clientSocket.end();
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+      }
+      return;
+    }
+    
+    // AI-NOTE: Successful authentication - clear any previous failures for this IP
+    // This allows legitimate users to recover quickly if they made mistakes
+    if (authFailRateLimitMap.has(clientIP)) {
+      authFailRateLimitMap.delete(clientIP);
+    }
+
+    // AI-NOTE: [INFO] Log target domain for monitoring and statistics
+    log('info', 'HTTPS tunnel request', { 
+      domain: hostname, 
+      port, 
+      clientIP 
+    });
+
+    // Create TCP connection to target server
+    // AI-NOTE: Using PROXY_TIMEOUT_MS for CONNECT tunnel timeout as well
+    const targetSocket = net.createConnection({
+      host: hostname,
+      port: port,
+      timeout: PROXY_TIMEOUT_MS,
+    }, () => {
+      log('debug', 'Target connection established', { hostname, port });
+      
+      // AI-NOTE: [FIXED] Check socket state before writing
+      if (clientSocket.destroyed || clientSocket.writableEnded) {
+        log('debug', 'Client socket closed before CONNECT response', { hostname, port });
+        targetSocket.destroy();
+        return;
+      }
+      
+      // AI-NOTE: [CRITICAL] Send success response to client
+      try {
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        log('debug', 'CONNECT response sent', { hostname, port });
+      } catch (writeErr) {
+        log('error', 'Failed to write CONNECT response', { 
+          error: (writeErr as Error).message,
+          hostname, 
+          port 
+        });
+        targetSocket.destroy();
+        clientSocket.destroy();
+        return;
+      }
+      
+      // AI-NOTE: If there's data in head (sent before tunnel establishment), forward it
+      if (head && head.length > 0 && !targetSocket.destroyed) {
+        try {
+          targetSocket.write(head);
+        } catch (writeErr) {
+          log('debug', 'Failed to write head data', { error: (writeErr as Error).message });
+        }
+      }
+      
+      // AI-NOTE: [FIXED] Start data tunneling with proper stream completion
+      // Removed { end: false } to ensure streams are properly closed and all data is transferred
+      // This fixes IncompleteRead issues when downloading files through HTTPS tunnels (e.g., Google Slides images)
+      if (!clientSocket.destroyed && !targetSocket.destroyed) {
+        try {
+          // AI-NOTE: [FIXED] Add error handling for pipe operations
+          const targetToClient = targetSocket.pipe(clientSocket);
+          const clientToTarget = clientSocket.pipe(targetSocket);
+          
+          // Handle pipe errors to ensure both sockets are closed on error
+          targetToClient.on('error', (err) => {
+            log('error', 'Pipe error (target to client)', { error: err.message, hostname, port });
+            if (!clientSocket.destroyed) clientSocket.destroy();
+            if (!targetSocket.destroyed) targetSocket.destroy();
+          });
+          
+          clientToTarget.on('error', (err) => {
+            log('error', 'Pipe error (client to target)', { error: err.message, hostname, port });
+            if (!clientSocket.destroyed) clientSocket.destroy();
+            if (!targetSocket.destroyed) targetSocket.destroy();
+          });
+        } catch (pipeErr) {
+          log('error', 'Failed to setup pipe', { error: (pipeErr as Error).message, hostname, port });
+          if (!clientSocket.destroyed) clientSocket.destroy();
+          if (!targetSocket.destroyed) targetSocket.destroy();
+        }
+      }
+    });
+
+    targetSocket.on('error', (err) => {
+      log('error', 'HTTPS tunnel error', { 
+        error: err.message, 
+        code: (err as any).code,
+        hostname, 
+        port 
+      });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        } catch (writeErr) {
+          log('debug', 'Failed to write error response', { error: writeErr });
+        }
+        clientSocket.end();
+      }
+    });
+
+    targetSocket.on('timeout', () => {
+      log('error', 'HTTPS tunnel timeout', { hostname, port });
+      if (!clientSocket.destroyed && !clientSocket.writableEnded) {
+        try {
+          clientSocket.write('HTTP/1.1 504 Gateway Timeout\r\n\r\n');
+        } catch (writeErr) {
+          log('debug', 'Failed to write timeout response', { error: writeErr });
+        }
+        clientSocket.end();
+      }
+      targetSocket.destroy();
+    });
+
+    clientSocket.on('error', (err) => {
+      log('debug', 'Client socket error', { error: err.message });
+      if (!targetSocket.destroyed) {
+        targetSocket.destroy();
+      }
+    });
+
+    clientSocket.on('close', () => {
+      log('debug', 'Client socket closed', { hostname, port });
+      if (!targetSocket.destroyed) {
+        targetSocket.destroy();
+      }
+    });
+
+    targetSocket.on('close', () => {
+      log('debug', 'Target socket closed', { hostname, port });
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+    });
+  });
+  
+  // Handle regular HTTP requests (not CONNECT)
+  server.on('request', (req, res) => {
+    const clientIP = req.socket.remoteAddress || 'unknown';
+    
+    // AI-NOTE: Health check endpoint for monitoring
+    // AI-NOTE: [FIXED] Handle query string and validate HTTP method
+    const urlPath = req.url?.split('?')[0]; // Remove query string if present
+    if (urlPath === '/health' || urlPath === '/status') {
+      // Only allow GET and HEAD methods for health check
+      if (req.method !== 'GET' && req.method !== 'HEAD') {
+        if (!res.headersSent && !res.destroyed) {
+          try {
+            res.writeHead(405, { 'Content-Type': 'text/plain' });
+            res.end('Method Not Allowed');
+          } catch (writeErr) {
+            log('debug', 'Failed to write error response', { error: writeErr });
+          }
+        }
+        return;
+      }
+      
+      log('debug', 'Health check request', { clientIP, method: req.method });
+      
+      try {
+        const uptime = process.uptime();
+        const healthData = {
+          status: 'ok',
+          timestamp: new Date().toISOString(),
+          uptime: isNaN(uptime) ? 0 : uptime,
+          version: '1.0.0'
+        };
+        
+        if (!res.headersSent && !res.destroyed) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(healthData));
+        }
+      } catch (err) {
+        log('error', 'Health check error', { error: (err as Error).message, clientIP });
+        if (!res.headersSent && !res.destroyed) {
+          try {
+            res.writeHead(500, { 'Content-Type': 'text/plain' });
+            res.end('Internal Server Error');
+          } catch (writeErr) {
+            log('debug', 'Failed to write health check error', { error: writeErr });
+          }
+        }
+      }
+      return;
+    }
+    
+    // AI-NOTE: [DEBUG] Log ALL incoming requests for diagnostics
+    // This should fire for ALL requests, including CONNECT
+    log('info', '=== INCOMING REQUEST ===', {
+      method: req.method,
+      url: req.url,
+      clientIP,
+      socketReadyState: req.socket.readyState,
+      socketDestroyed: req.socket.destroyed,
+      socketWritableEnded: req.socket.writableEnded,
+      headers: Object.keys(req.headers),
+      httpVersion: req.httpVersion,
+      complete: req.complete
+    });
+    
+    // Request logging
+    log('debug', 'Incoming request', {
+      method: req.method,
+      url: req.url,
+      headers: {
+        host: req.headers.host,
+        'user-agent': req.headers['user-agent'],
+        'proxy-authorization': req.headers['proxy-authorization'] ? '***' : undefined
+      },
+      clientIP,
+      socketReadyState: req.socket.readyState
+    });
+
+  // IP check
+  if (!checkIP(clientIP)) {
+    log('error', 'IP not allowed', { clientIP });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('IP address not allowed');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
+  // Check if IP is blocked due to too many failed auth attempts (brute force protection)
+  if (!checkAuthFailRateLimit(clientIP)) {
+    const entry = authFailRateLimitMap.get(clientIP);
+    log('info', 'Blocked IP (too many failed auth attempts)', { 
+      clientIP,
+      blockedUntil: entry?.blockedUntil ? new Date(entry.blockedUntil).toISOString() : undefined
+    });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(429, { 'Content-Type': 'text/plain' });
+        res.end('Too Many Requests');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
+  // Authentication check
+  const authHeader = req.headers['proxy-authorization'];
+  if (!checkAuth(authHeader)) {
+    // Record failed authentication attempt
+    recordAuthFailure(clientIP);
+    // AI-NOTE: Log as debug instead of error - this is normal for bots/scanners
+    log('debug', 'Authentication failed', { clientIP });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(407, {
+          'Content-Type': 'text/plain',
+          'Proxy-Authenticate': 'Basic realm="Sami LLM Proxy"'
+        });
+        res.end('Proxy authentication required');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+  
+  // AI-NOTE: Successful authentication - clear any previous failures for this IP
+  // This allows legitimate users to recover quickly if they made mistakes
+  if (authFailRateLimitMap.has(clientIP)) {
+    authFailRateLimitMap.delete(clientIP);
+  }
+
+  // AI-NOTE: CONNECT requests are handled in 'connect' event above
+  // Here we handle only regular HTTP requests (GET, POST, etc.)
+  // Regular HTTP request handling
+  // AI-NOTE: For HTTP proxy, client sends full URL in req.url
+  // Example: GET http://api.openrouter.ai/api/v1/models HTTP/1.1
+  // But if this is a direct request to proxy (not through proxy agent),
+  // then req.url will be a relative path
+  
+  if (!req.url) {
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Bad Request: No URL');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
+  // AI-NOTE: [FIXED] Validate URL length to prevent DoS attacks
+  if (req.url.length > MAX_URL_LENGTH) {
+    log('error', 'Request URL too long', { 
+      urlLength: req.url.length, 
+      maxLength: MAX_URL_LENGTH,
+      clientIP 
+    });
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(414, { 'Content-Type': 'text/plain' });
+        res.end('URI Too Long');
+      } catch (writeErr) {
+        log('debug', 'Failed to write error response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
+  let targetUrl: string;
+  
+  // If this is a full URL (starts with http:// or https://)
+  // This is standard format for HTTP proxy
+  if (req.url.startsWith('http://') || req.url.startsWith('https://')) {
+    targetUrl = req.url;
+  } else {
+    // If this is a relative path, it could be:
+    // 1. Direct request to proxy (not through proxy agent) - ignore
+    // 2. Client error
+    
+    // AI-NOTE: https-proxy-agent uses CONNECT for HTTPS,
+    // and for HTTP may send full URL
+    // If relative path arrives, it's most likely a direct request to proxy
+    log('debug', 'Relative URL in proxy request (not a proxied request)', {
+      url: req.url,
+      host: req.headers.host,
+      method: req.method
+    });
+    
+    // Return proxy information
+    if (!res.headersSent && !res.destroyed) {
+      try {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('Sami LLM Proxy Server is running. Use this as HTTP/HTTPS proxy.');
+      } catch (writeErr) {
+        log('debug', 'Failed to write response', { error: writeErr });
+      }
+    }
+    return;
+  }
+
+  // Extract domain from targetUrl for logging
+  try {
+    const parsedTargetUrl = parseUrl(targetUrl);
+    // AI-NOTE: [FIXED] Validate hostname is not null before logging
+    if (parsedTargetUrl && parsedTargetUrl.hostname) {
+      log('info', 'Proxying HTTP request', {
+        method: req.method,
+        domain: parsedTargetUrl.hostname,
+        port: parsedTargetUrl.port || (parsedTargetUrl.protocol === 'https:' ? 443 : 80),
+        path: parsedTargetUrl.path,
+        clientIP
+      });
+    } else {
+      // Fallback if hostname is null
+      log('info', 'Proxying HTTP request', {
+        method: req.method,
+        targetUrl,
+        clientIP
+      });
+    }
+  } catch (err) {
+    // Fallback to full URL if parsing fails
+    log('info', 'Proxying HTTP request', {
+      method: req.method,
+      targetUrl,
+      clientIP
+    });
+  }
+
+  // Proxy HTTP request
+  proxyHttpRequest(req, res, targetUrl);
+});
+
+  // AI-NOTE: [DEBUG] Log server events BEFORE startup
+  // AI-NOTE: [CRITICAL] In Node.js, http.createServer should handle CONNECT automatically
+  // But if request doesn't arrive, may need to use different approach
+  server.on('connection', (socket) => {
+    const netSocket = socket as net.Socket;
+    log('debug', 'New connection', {
+      remoteAddress: netSocket.remoteAddress,
+      remotePort: netSocket.remotePort,
+      localAddress: netSocket.localAddress,
+      localPort: netSocket.localPort
+    });
+    
+    // AI-NOTE: [DEBUG] Log only close and error events
+    // DO NOT log 'data' - this intercepts data from stream and http.createServer cannot read it
+    netSocket.on('close', () => {
+      log('debug', 'Socket closed', {
+        remoteAddress: netSocket.remoteAddress
+      });
+    });
+    
+    netSocket.on('error', (err) => {
+      const errorCode = (err as any).code;
+      const knownConnectionErrors = ['ECONNRESET', 'EPIPE', 'ETIMEDOUT'];
+      const isKnownError = knownConnectionErrors.includes(errorCode);
+      
+      // Log known connection errors as debug (common from bots)
+      if (isKnownError) {
+        log('debug', 'Socket error (likely bot/scanner)', {
+          remoteAddress: netSocket.remoteAddress,
+          error: err.message,
+          code: errorCode
+        });
+      } else {
+        log('error', 'Socket error', {
+          remoteAddress: netSocket.remoteAddress,
+          error: err.message,
+          code: errorCode
+        });
+      }
+    });
+  });
+
+// Start server
+server.listen(PROXY_PORT, PROXY_ADDRESS, () => {
+  log('info', `Sami LLM Proxy Server started`, {
+    port: PROXY_PORT,
+    address: PROXY_ADDRESS,
+    auth: PROXY_AUTH_USERNAME ? 'enabled' : 'disabled',
+    allowedIPs: ALLOWED_IPS.length > 0 ? ALLOWED_IPS : 'all',
+    logLevel: LOG_LEVEL,
+    timeout: `${PROXY_TIMEOUT_MS}ms (${Math.round(PROXY_TIMEOUT_MS / 60000)} minutes)`,
+    bruteForceProtection: `${AUTH_FAIL_RATE_LIMIT_MAX_ATTEMPTS} failed auth attempts per ${AUTH_FAIL_RATE_LIMIT_WINDOW_MS / 1000}s (authenticated requests unlimited)`,
+    maxConnections: MAX_CONCURRENT_CONNECTIONS,
+    maxUrlLength: MAX_URL_LENGTH
+  });
+});
+
+server.on('error', (err) => {
+  log('error', 'Server error', {
+    error: err.message,
+    code: (err as any).code
+  });
+});
+
+server.on('clientError', (err, socket) => {
+  const netSocket = socket as net.Socket;
+  const errorCode = (err as any).code;
+  const remoteAddress = netSocket.remoteAddress || 'unknown';
+  
+  // AI-NOTE: Many parse errors are from bots/scanners sending malformed requests
+  // These are expected on a public proxy server, so log as debug instead of error
+  const knownBotErrors = [
+    'HPE_PAUSED_H2_UPGRADE',      // HTTP/2 upgrade attempts
+    'HPE_INVALID_METHOD',         // Invalid HTTP method
+    'HPE_INVALID_CONSTANT',       // Invalid HTTP constant
+    'HPE_UNEXPECTED_CONTENT_LENGTH', // Unexpected content length
+    'ECONNRESET',                 // Connection reset by client
+    'EPIPE',                      // Broken pipe
+    'ETIMEDOUT'                   // Connection timeout
+  ];
+  
+  const isKnownBotError = knownBotErrors.some(code => 
+    errorCode === code || err.message.includes(code)
+  );
+  
+  // Log known bot errors as debug, others as error
+  if (isKnownBotError) {
+    log('debug', 'Client error (likely bot/scanner)', {
+      error: err.message,
+      code: errorCode,
+      remoteAddress
+    });
+  } else {
+    log('error', 'Client error', {
+      error: err.message,
+      code: errorCode,
+      remoteAddress
+    });
+  }
+  
+  // Close the socket
+  if (!netSocket.destroyed) {
+    netSocket.destroy();
+  }
+});
+
+// Graceful shutdown
+let shutdownTimeout: NodeJS.Timeout | null = null;
+
+function gracefulShutdown(signal: string) {
+  log('info', `${signal} received, shutting down gracefully`);
+  
+  // AI-NOTE: [FIXED] Clear rate limit cleanup interval
+  if (rateLimitCleanupInterval) {
+    clearInterval(rateLimitCleanupInterval);
+  }
+  
+  // AI-NOTE: [FIXED] Prevent multiple shutdown attempts
+  if (shutdownTimeout) {
+    return; // Shutdown already in progress
+  }
+  
+  server.close(() => {
+    log('info', 'Server closed');
+    // AI-NOTE: [FIXED] Clear shutdown timeout if server closed successfully
+    if (shutdownTimeout) {
+      clearTimeout(shutdownTimeout);
+      shutdownTimeout = null;
+    }
+    process.exit(0);
+  });
+  
+  // Force exit after timeout if graceful shutdown fails
+  shutdownTimeout = setTimeout(() => {
+    log('error', 'Forced shutdown after timeout');
+    shutdownTimeout = null;
+    process.exit(1);
+  }, 10000); // 10 seconds timeout
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+

@@ -1,0 +1,29 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+.env.*.local
+!.env.example
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Docker build artifacts
+Docker/
+*.tar
+
+# IDE
+.vscode/
+.idea/
+
+# Documentation (keep only main README.md)
+docs/
+README_RU.md
+DOCKER_HUB_PUBLISH.md
+GITHUB_PUBLISH.md
+LINK_GITHUB_DOCKERHUB.md
+systemd/
+docker-compose.yml
+
